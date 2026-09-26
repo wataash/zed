@@ -598,6 +598,8 @@
   "fullscreen_mode": "native",
   // Titlebar related settings
   "title_bar": {
+    // Tint the title bar with a stable color for the workspace's first project root.
+    "workspace_color": true,
     // Whether to show git status indicators on the branch icon in the titlebar.
     "show_branch_status_icon": false,
     // Whether to show the branch name button in the titlebar.
@@ -1557,7 +1559,13 @@
     //   * "all": Use all gitignored files
     //   * "indexed": Use only the files Zed had indexed
     //   * "smart": Be smart and search for ignored when called from a gitignored worktree
+    //   * "zall": Use all gitignored files, walking directories Zed has not indexed
     "include_ignored": "smart",
+    // Globs of paths to hide from file finder results, relative to each worktree root.
+    // Matching directories are not walked when `include_ignored` is "zall".
+    //
+    // Example: ["**/node_modules"]
+    "exclusions": [],
     // Whether to include text channels in file finder results.
     "include_channels": false,
   },

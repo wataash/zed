@@ -287,16 +287,23 @@ impl Editor {
                     let file = buffer.read(cx).file()?;
                     let worktree_id = file.worktree_id(cx);
                     let dir_rel_path = file.path().parent()?.into_arc();
+                    let document_stem = file.path().file_stem()?;
                     let worktree = self
                         .project
                         .as_ref()?
                         .read(cx)
                         .worktree_for_id(worktree_id, cx)?;
 
+                    // Matches VS Code's `markdown.copyFiles.destination` of
+                    // `${documentBaseName}.${isoTime as YYMMDDhhmmss}.${fileExtName}`.
+                    let base = format!(
+                        "{document_stem}.{}",
+                        chrono::Utc::now().format("%y%m%d%H%M%S")
+                    );
                     let extension = image.format.extension();
                     let snapshot = worktree.read(cx).snapshot();
                     let (filename, file_path) =
-                        unused_image_path(&dir_rel_path, extension, |path| {
+                        unused_image_path(&dir_rel_path, &base, extension, |path| {
                             snapshot.entry_for_path(path).is_some()
                         })?;
 
@@ -343,7 +350,8 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(snippet) = Snippet::parse(&format!("![$1]({filename})$0")).log_err() else {
+        let destination = markdown_link_destination(filename);
+        let Some(snippet) = Snippet::parse(&format!("![$1]({destination})$0")).log_err() else {
             return;
         };
         let display_map = self.display_snapshot(cx);
@@ -730,24 +738,42 @@ fn edit_for_markdown_paste<'a>(
     (range, new_text)
 }
 
-/// Returns a filename of the form `image.{extension}` (or `image_{N}.{extension}`
+/// Returns a filename of the form `{base}.{extension}` (or `{base}_{N}.{extension}`
 /// if taken) that does not collide with an existing entry in `dir_rel_path`,
 /// along with the full path of the candidate file.
 fn unused_image_path(
     dir_rel_path: &RelPath,
+    base: &str,
     extension: &str,
     exists: impl Fn(&RelPath) -> bool,
 ) -> Option<(String, Arc<RelPath>)> {
-    let mut filename = format!("image.{extension}");
+    let mut filename = format!("{base}.{extension}");
     let mut counter = 1u32;
     loop {
         let candidate = dir_rel_path.join(RelPath::from_unix_str(&filename).ok()?);
         if !exists(&candidate) {
             return Some((filename, candidate.into()));
         }
-        filename = format!("image_{counter}.{extension}");
+        filename = format!("{base}_{counter}.{extension}");
         counter += 1;
     }
+}
+
+/// Formats `filename` as a CommonMark link destination by percent-encoding every
+/// UTF-8 byte outside the URL unreserved set (ASCII alphanumerics and `-._~`).
+/// Wrapping in `<...>` instead would still leave `#` read as a fragment, `%` as
+/// an existing escape and newlines unrepresentable, and the result is also free
+/// of the `$`, `}` and `\` that LSP snippet syntax treats specially.
+fn markdown_link_destination(filename: &str) -> String {
+    let mut destination = String::with_capacity(filename.len());
+    for byte in filename.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            destination.push(byte as char);
+        } else {
+            destination.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    destination
 }
 
 /// Whether `text` consists solely of a single URL, as opposed to merely
@@ -760,4 +786,87 @@ fn is_standalone_url(text: &str) -> bool {
         .links(text)
         .next()
         .is_some_and(|link| link.start() == 0 && link.end() == text.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unused_image_path_appends_counter_on_collision() {
+        let dir = RelPath::from_unix_str("docs").unwrap();
+        let taken = ["docs/note.260914012345.png", "docs/note.260914012345_1.png"];
+        let exists = |path: &RelPath| taken.contains(&path.as_unix_str());
+
+        let (filename, path) =
+            unused_image_path(dir, "note.260914012345", "png", |_| false).unwrap();
+        assert_eq!(filename, "note.260914012345.png");
+        assert_eq!(path.as_unix_str(), "docs/note.260914012345.png");
+
+        let (filename, path) = unused_image_path(dir, "note.260914012345", "png", exists).unwrap();
+        assert_eq!(filename, "note.260914012345_2.png");
+        assert_eq!(path.as_unix_str(), "docs/note.260914012345_2.png");
+
+        // The taken names live under `docs/`, so the same base is free at the root.
+        let (filename, path) =
+            unused_image_path(RelPath::empty(), "note.260914012345", "png", exists).unwrap();
+        assert_eq!(filename, "note.260914012345.png");
+        assert_eq!(path.as_unix_str(), "note.260914012345.png");
+    }
+
+    #[test]
+    fn test_markdown_link_destination_percent_encodes_reserved_bytes() {
+        for (filename, expected) in [
+            ("note.260914012345.png", "note.260914012345.png"),
+            (
+                "my-note_v2~.260914012345.png",
+                "my-note_v2~.260914012345.png",
+            ),
+            (
+                "メモ.260914012345.png",
+                "%E3%83%A1%E3%83%A2.260914012345.png",
+            ),
+            ("my note.260914012345.png", "my%20note.260914012345.png"),
+            (
+                "note (1).260914012345.png",
+                "note%20%281%29.260914012345.png",
+            ),
+            ("$note.260914012345.png", "%24note.260914012345.png"),
+            ("note#1.260914012345.png", "note%231.260914012345.png"),
+            ("100%.260914012345.png", "100%25.260914012345.png"),
+            ("a\nb.260914012345.png", "a%0Ab.260914012345.png"),
+            ("a\\b.260914012345.png", "a%5Cb.260914012345.png"),
+            (
+                "${a}<b>.260914012345.png",
+                "%24%7Ba%7D%3Cb%3E.260914012345.png",
+            ),
+        ] {
+            assert_eq!(markdown_link_destination(filename), expected);
+        }
+    }
+
+    #[test]
+    fn test_markdown_link_destination_survives_snippet_parse() {
+        for filename in [
+            "note.260914012345.png",
+            "メモ.260914012345.png",
+            "my note.260914012345.png",
+            "note (1).260914012345.png",
+            "$note.260914012345.png",
+            "note#1.260914012345.png",
+            "100%.260914012345.png",
+            "a\nb.260914012345.png",
+            "a\\b.260914012345.png",
+            "${a}<b>.260914012345.png",
+        ] {
+            let destination = markdown_link_destination(filename);
+            let source = format!("![$1]({destination})$0");
+            let snippet = Snippet::parse(&source).unwrap();
+            assert_eq!(
+                snippet.text,
+                format!("![]({destination})"),
+                "source: {source:?}"
+            );
+        }
+    }
 }

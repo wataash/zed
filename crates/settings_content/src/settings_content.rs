@@ -960,6 +960,11 @@ pub struct FileFinderSettingsContent {
     ///
     /// Default: false
     pub include_channels: Option<bool>,
+    /// Globs of paths to hide from file finder results, relative to each worktree root.
+    /// Matching directories are not walked when `include_ignored` is `zall`.
+    ///
+    /// Default: []
+    pub exclusions: Option<Vec<String>>,
 }
 
 #[derive(
@@ -985,6 +990,8 @@ pub enum IncludeIgnoredContent {
     /// Be smart and search for ignored when called from a gitignored worktree
     #[default]
     Smart,
+    /// Use all gitignored files, walking directories Zed has not indexed
+    Zall,
 }
 
 #[derive(

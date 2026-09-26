@@ -1954,6 +1954,61 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_file_urls_open_in_current_workspace(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+        let fs = cx.update_workspace(|workspace, _, cx| workspace.project().read(cx).fs().clone());
+        let target_path = path!("/external/日本語 notes.md");
+        fs.as_fake()
+            .insert_tree(
+                path!("/external"),
+                serde_json::json!({"日本語 notes.md": "first\nsecond\n"}),
+            )
+            .await;
+        let mut url = url::Url::from_file_path(target_path).expect("absolute file URL");
+        url.set_fragment(Some("2"));
+
+        for open_with_action in [false, true] {
+            cx.set_state(&format!("{url}ˇ"));
+            let url_path = url
+                .as_str()
+                .strip_prefix("file:///")
+                .expect("file URL prefix");
+            let screen_coord = cx.pixel_position(&format!("file:///ˇ{url_path}"));
+            if open_with_action {
+                cx.update_editor(|editor, window, cx| {
+                    editor.open_url(&crate::actions::OpenUrl, window, cx)
+                });
+            } else {
+                cx.simulate_mouse_move(screen_coord, None, Modifiers::secondary_key());
+                cx.simulate_click(screen_coord, Modifiers::secondary_key());
+            }
+            cx.run_until_parked();
+            assert_eq!(
+                cx.opened_url(),
+                None,
+                "file URL must not reach the OS handler"
+            );
+            cx.update_workspace(|workspace, window, cx| {
+                let editor = workspace
+                    .active_item_as::<Editor>(cx)
+                    .expect("file should open in this workspace");
+                editor.update(cx, |editor, cx| {
+                    assert_eq!(editor.text(cx), "first\nsecond\n");
+                    let snapshot = editor.snapshot(window, cx);
+                    assert_eq!(
+                        editor
+                            .selections
+                            .newest::<Point>(&snapshot.display_snapshot)
+                            .head(),
+                        Point::new(1, 0)
+                    );
+                });
+            });
+        }
+    }
+
+    #[gpui::test]
     async fn test_hover_preconditions(cx: &mut gpui::TestAppContext) {
         init_test(cx, |_| {});
         let mut cx = EditorLspTestContext::new_rust(

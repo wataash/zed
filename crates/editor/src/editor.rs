@@ -71,8 +71,10 @@ mod edit_prediction;
 mod input;
 mod markdown_actions;
 mod navigation;
+mod personal_actions;
 mod rewrap;
 mod selection;
+mod selection_tools;
 
 pub(crate) use actions::*;
 pub use clipboard::ClipboardSelection;
@@ -9078,6 +9080,45 @@ impl Editor {
         }) {
             cx.write_to_clipboard(ClipboardItem::new_string(file_location));
         }
+    }
+
+    pub fn set_indentation(
+        &mut self,
+        action: &SetIndentation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_size) = NonZeroU32::new(action.tab_size) else {
+            return;
+        };
+        let Some(buffer) = self.buffer.read(cx).as_singleton() else {
+            self.notify_personal_error(
+                "Indentation can only be set in a single-file editor.",
+                window,
+                cx,
+            );
+            return;
+        };
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_indentation(tab_size, action.hard_tabs, cx)
+        });
+    }
+
+    pub fn insert_date(&mut self, _: &InsertDate, window: &mut Window, cx: &mut Context<Self>) {
+        let text = chrono::Local::now().format("%Y-%m-%d %a").to_string();
+        self.insert(&text, window, cx);
+    }
+
+    pub fn insert_date_time(
+        &mut self,
+        _: &InsertDateTime,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = chrono::Local::now()
+            .format("%Y-%m-%d %a %H:%M:%S")
+            .to_string();
+        self.insert(&text, window, cx);
     }
 
     pub fn insert_uuid_v4(

@@ -1,6 +1,7 @@
 // Disable command line from opening on release mode
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod command_history;
 mod reliability;
 mod watcher_debug;
 mod zed;
@@ -585,6 +586,7 @@ fn main() {
         Client::set_global(client.clone(), cx);
 
         zed::init(cx);
+        command_history::init(cx);
         #[cfg(target_os = "macos")]
         zed::move_to_applications::init(cx);
         project::Project::init(&client, cx);

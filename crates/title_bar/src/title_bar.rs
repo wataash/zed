@@ -4,6 +4,7 @@ mod onboarding_banner;
 mod plan_chip;
 mod title_bar_settings;
 mod update_version;
+mod workspace_color;
 
 use crate::application_menu::{ApplicationMenu, show_menus};
 use crate::plan_chip::PlanChip;
@@ -238,6 +239,25 @@ impl Render for TitleBar {
         }
 
         let title_bar_settings = *TitleBarSettings::get_global(cx);
+        let workspace_color_hue = title_bar_settings
+            .workspace_color
+            .then(|| {
+                let project = self.project.read(cx);
+                // The first root stays stable when the active file or repository changes.
+                let worktree = project.visible_worktrees(cx).next()?;
+                let path = worktree.read(cx).abs_path();
+                let remote = project
+                    .remote_connection_options(cx)
+                    .map(|options| (options.connection_type(), options.host()));
+                let remote = remote
+                    .as_ref()
+                    .map(|(connection_type, host)| (*connection_type, host.as_str()));
+                Some(workspace_color::workspace_color_hue(&path, remote))
+            })
+            .flatten();
+        self.platform_titlebar.update(cx, |titlebar, cx| {
+            titlebar.set_workspace_color_hue(workspace_color_hue, cx);
+        });
         let button_layout = title_bar_settings.button_layout;
         let is_git_enabled = ProjectSettings::get_global(cx).git.enabled.status;
 
@@ -476,6 +496,16 @@ impl TitleBar {
         };
 
         let mut subscriptions = Vec::new();
+        subscriptions.push(cx.subscribe(&project, |_, _, event, cx| {
+            if matches!(
+                event,
+                project::Event::WorktreeAdded(_)
+                    | project::Event::WorktreeRemoved(_)
+                    | project::Event::WorktreeOrderChanged
+            ) {
+                cx.notify();
+            }
+        }));
         subscriptions.push(
             cx.observe(&workspace.weak_handle().upgrade().unwrap(), |_, _, cx| {
                 cx.notify()

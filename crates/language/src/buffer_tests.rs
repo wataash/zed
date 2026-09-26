@@ -1,5 +1,6 @@
 use super::*;
 use crate::Buffer;
+use crate::language_settings::LanguageSettings;
 use clock::ReplicaId;
 use collections::BTreeMap;
 use futures::FutureExt as _;
@@ -16,6 +17,7 @@ use settings::{AllLanguageSettingsContent, LanguageSettingsContent};
 use std::collections::BTreeSet;
 use std::{
     env,
+    num::NonZeroU32,
     ops::Range,
     sync::LazyLock,
     time::{Duration, Instant},
@@ -41,6 +43,37 @@ pub static TRAILING_WHITESPACE_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| 
 #[ctor::ctor(unsafe)]
 fn init_logger() {
     zlog::init_test();
+}
+
+#[gpui::test]
+fn test_indentation_override_is_local_and_survives_modeline_updates(cx: &mut gpui::App) {
+    init_settings(cx, |_| {});
+    let buffer = cx.new(|cx| Buffer::local("\ttext", cx));
+    let other_buffer = cx.new(|cx| Buffer::local("other", cx));
+    let other_settings = LanguageSettings::for_buffer(other_buffer.read(cx), cx);
+    let original_version = buffer.read(cx).version();
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_indentation(NonZeroU32::new(3).expect("nonzero"), false, cx);
+        buffer.set_modeline(
+            Some(crate::modeline::ModelineSettings {
+                tab_size: NonZeroU32::new(8),
+                hard_tabs: Some(true),
+                ..Default::default()
+            }),
+            cx,
+        );
+    });
+    let settings = LanguageSettings::for_buffer(buffer.read(cx), cx);
+    assert_eq!(settings.tab_size.get(), 3);
+    assert!(!settings.hard_tabs);
+    let snapshot = buffer.read(cx).snapshot().clone();
+    assert_eq!(snapshot.settings_at(0, cx).tab_size.get(), 3);
+    assert_eq!(buffer.read(cx).text(), "\ttext");
+    assert_eq!(buffer.read(cx).version(), original_version);
+    assert_eq!(
+        LanguageSettings::for_buffer(other_buffer.read(cx), cx),
+        other_settings
+    );
 }
 
 #[gpui::test]

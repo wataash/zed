@@ -665,6 +665,16 @@ impl EditorElement {
             register_action(editor, window, Editor::restore_and_next);
             register_action(editor, window, Editor::apply_all_diff_hunks);
             register_action(editor, window, Editor::apply_selected_diff_hunks);
+            register_action(editor, window, Editor::calculate_selection);
+            register_action(editor, window, Editor::precise_calculation);
+            register_action(editor, window, Editor::uniq_selection);
+            register_action(editor, window, Editor::sort_lines_descending);
+            register_action(editor, window, Editor::insert_clipboard_file_uri);
+            register_action(editor, window, Editor::copy_current_code_block);
+            register_action(editor, window, Editor::open_directory_in_tilix);
+            register_action(editor, window, Editor::set_indentation);
+            register_action(editor, window, Editor::insert_date);
+            register_action(editor, window, Editor::insert_date_time);
             register_action(editor, window, Editor::insert_uuid_v4);
             register_action(editor, window, Editor::insert_uuid_v7);
             register_action(editor, window, Editor::align_selections);

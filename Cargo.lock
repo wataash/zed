@@ -5572,6 +5572,7 @@ dependencies = [
  "base64 0.22.1",
  "breadcrumbs",
  "buffer_diff",
+ "chrono",
  "client",
  "clock",
  "collections",
@@ -6414,10 +6415,13 @@ dependencies = [
  "futures 0.3.34",
  "fuzzy",
  "fuzzy_nucleo",
+ "globset",
  "gpui",
  "language",
+ "log",
  "menu",
  "open_path_prompt",
+ "paths",
  "picker",
  "picker_preview",
  "pretty_assertions",
@@ -12326,6 +12330,7 @@ dependencies = [
 name = "open_path_prompt"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "editor",
  "file_icons",
  "futures 0.3.34",
@@ -12333,7 +12338,6 @@ dependencies = [
  "gpui",
  "picker",
  "project",
- "serde",
  "serde_json",
  "settings",
  "theme",

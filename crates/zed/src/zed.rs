@@ -95,7 +95,9 @@ use util::rel_path::RelPath;
 use util::{ResultExt, asset_str, maybe};
 use uuid::Uuid;
 use vim_mode_setting::VimModeSetting;
-use workspace::notifications::{NotificationId, dismiss_app_notification, show_app_notification};
+use workspace::notifications::{
+    NotificationId, NotifyTaskExt as _, dismiss_app_notification, show_app_notification,
+};
 
 use workspace::{
     AppState, MultiWorkspace, NewFile, NewWindow, OpenLog, Panel, Toast, Workspace,
@@ -190,6 +192,16 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    cx.on_action(|_: &editor::actions::OpenDirectoryInTilix, cx| {
+        with_active_or_new_workspace(cx, |workspace, window, cx| {
+            let directory = Editor::tilix_directory_for_project(workspace.project().read(cx), cx);
+            Editor::launch_tilix(directory, cx).detach_and_notify_err(
+                cx.entity().downgrade(),
+                window,
+                cx,
+            );
+        });
+    });
     #[cfg(target_os = "macos")]
     cx.on_action(|_: &Hide, cx| cx.hide());
     #[cfg(target_os = "macos")]
