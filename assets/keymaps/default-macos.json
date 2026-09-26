@@ -1302,6 +1302,7 @@
     "use_key_equivalents": true,
     "bindings": {
       "cmd-shift-i": "search::ToggleIncludeIgnored",
+      "shift-backspace": "file_finder::ExcludeSelected",
     },
   },
   {

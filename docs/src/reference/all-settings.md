@@ -708,6 +708,32 @@ See [Git documentation](../git.md#diff-view-styles) for more details.
 
 `boolean` values
 
+## Enable/Disable AI In Directories
+
+- Description: Enables or disables AI for worktrees under the given directories, overriding `disable_ai`. The deepest listed directory wins, and `disable_ai_in_directories` wins for a directory listed in both. While any open local worktree is inside, or contains, a directory that resolves to disabled, AI is disabled everywhere. A worktree root that is a symlink is also checked by its target. Only user settings can set these.
+- Setting: `enable_ai_in_directories`, `disable_ai_in_directories`
+- Default: `[]`
+
+**Example**
+
+Disable AI everywhere except `~/src/oss`, but keep it disabled in `~/src/oss/credentials`:
+
+```json [settings]
+{
+  "disable_ai": true,
+  "enable_ai_in_directories": ["~/src/oss"],
+  "disable_ai_in_directories": ["~/src/oss/credentials"]
+}
+```
+
+Disable AI only in `~/secrets`:
+
+```json [settings]
+{
+  "disable_ai_in_directories": ["~/secrets"]
+}
+```
+
 ## Direnv Integration
 
 - Description: Settings for [direnv](https://direnv.net/) integration. Requires `direnv` to be installed.

@@ -21326,3 +21326,115 @@ async fn code_action_project(
 
     (project, buffer, handle, fake_servers)
 }
+
+#[gpui::test]
+async fn test_disable_ai_in_directories(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            "public": { "a.txt": "" },
+            "secret": { "b.txt": "", "shared": { "c.txt": "" } },
+        }),
+    )
+    .await;
+    fs.insert_symlink(path!("/root/link"), path!("/root/secret").into())
+        .await;
+    let project = Project::test(fs.clone(), [path!("/root/public").as_ref()], cx).await;
+    let set_user_settings = |settings: serde_json::Value, cx: &mut gpui::TestAppContext| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.set_user_settings(&settings.to_string(), cx).unwrap();
+        });
+    };
+    let add_worktree = async |path: &str, cx: &mut gpui::TestAppContext| {
+        let (worktree, _) = project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(path, false, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        worktree.read_with(cx, |worktree, _| worktree.id())
+    };
+    let remove_worktree = |worktree_id, cx: &mut gpui::TestAppContext| {
+        project.update(cx, |project, cx| project.remove_worktree(worktree_id, cx));
+        cx.run_until_parked();
+    };
+    let disable_ai = |cx: &mut gpui::TestAppContext| {
+        cx.update(|cx| {
+            <project::DisableAiSettings as settings::Settings>::get_global(cx).disable_ai
+        })
+    };
+
+    set_user_settings(
+        json!({ "disable_ai_in_directories": [path!("/root/secret")] }),
+        cx,
+    );
+    assert!(!disable_ai(cx), "Worktrees outside the directory keep AI");
+
+    let secret_file = add_worktree(path!("/root/secret/b.txt"), cx).await;
+    assert!(disable_ai(cx), "A file inside the directory disables AI");
+    remove_worktree(secret_file, cx);
+    assert!(!disable_ai(cx), "Closing it restores AI");
+
+    let parent = add_worktree(path!("/root"), cx).await;
+    assert!(
+        disable_ai(cx),
+        "A worktree containing the directory disables AI"
+    );
+    remove_worktree(parent, cx);
+
+    let symlink = add_worktree(path!("/root/link/b.txt"), cx).await;
+    assert!(disable_ai(cx), "A symlink into the directory disables AI");
+    remove_worktree(symlink, cx);
+    assert!(!disable_ai(cx));
+
+    set_user_settings(
+        json!({
+            "disable_ai": true,
+            "enable_ai_in_directories": [path!("/root/public"), path!("/root/secret")],
+            "disable_ai_in_directories": [path!("/root/secret/shared")],
+        }),
+        cx,
+    );
+    assert!(!disable_ai(cx), "A directory can enable AI");
+    let shared = add_worktree(path!("/root/secret/shared/c.txt"), cx).await;
+    assert!(disable_ai(cx), "The deepest directory wins");
+    remove_worktree(shared, cx);
+    let secret = add_worktree(path!("/root/secret"), cx).await;
+    assert!(
+        disable_ai(cx),
+        "A subdirectory that disables AI covers its parent"
+    );
+    remove_worktree(secret, cx);
+    let other = add_worktree(path!("/root"), cx).await;
+    assert!(
+        disable_ai(cx),
+        "Worktrees outside the directories keep `disable_ai`"
+    );
+    remove_worktree(other, cx);
+    assert!(!disable_ai(cx));
+
+    project.update(cx, |project, cx| {
+        let worktree_ids = project.worktrees(cx).map(|worktree| worktree.read(cx).id());
+        for worktree_id in worktree_ids.collect::<Vec<_>>() {
+            project.remove_worktree(worktree_id, cx);
+        }
+    });
+    cx.run_until_parked();
+    assert!(disable_ai(cx), "Without worktrees, `disable_ai` applies");
+
+    set_user_settings(
+        json!({
+            "enable_ai_in_directories": [path!("/root/public")],
+            "disable_ai_in_directories": [path!("/root/public")],
+        }),
+        cx,
+    );
+    add_worktree(path!("/root/public"), cx).await;
+    assert!(
+        disable_ai(cx),
+        "Disabling wins for a directory listed in both"
+    );
+}

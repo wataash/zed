@@ -33,6 +33,7 @@ pub struct PlatformTitleBar {
     system_window_tabs: Entity<SystemWindowTabs>,
     button_layout: Option<WindowButtonLayout>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+    workspace_color_hue: Option<f32>,
 }
 
 impl PlatformTitleBar {
@@ -48,6 +49,7 @@ impl PlatformTitleBar {
             system_window_tabs,
             button_layout: None,
             multi_workspace: None,
+            workspace_color_hue: None,
         }
     }
 
@@ -61,7 +63,7 @@ impl PlatformTitleBar {
     }
 
     pub fn title_bar_color(&self, window: &mut Window, cx: &mut Context<Self>) -> Hsla {
-        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+        let mut color = if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             if window.is_window_active() && !self.should_move {
                 cx.theme().colors().title_bar_background
             } else {
@@ -69,6 +71,19 @@ impl PlatformTitleBar {
             }
         } else {
             cx.theme().colors().title_bar_background
+        };
+        if let Some(hue) = self.workspace_color_hue {
+            // Keep the theme's lightness and transparency, including its inactive state.
+            color.h = hue;
+            color.s = 0.35;
+        }
+        color
+    }
+
+    pub fn set_workspace_color_hue(&mut self, hue: Option<f32>, cx: &mut Context<Self>) {
+        if self.workspace_color_hue != hue {
+            self.workspace_color_hue = hue;
+            cx.notify();
         }
     }
 

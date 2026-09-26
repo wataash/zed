@@ -1259,6 +1259,7 @@
     "bindings": {
       "ctrl-p": "file_finder::Toggle",
       "ctrl-shift-i": "search::ToggleIncludeIgnored",
+      "shift-backspace": "file_finder::ExcludeSelected",
     },
   },
   {

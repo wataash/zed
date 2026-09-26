@@ -321,6 +321,11 @@ impl LanguageSettings {
         if let Some(modeline) = buffer.modeline() {
             merge_with_modeline(Arc::make_mut(&mut settings), modeline);
         }
+        if let Some((tab_size, hard_tabs)) = buffer.indentation_override() {
+            let settings = Arc::make_mut(&mut settings);
+            settings.tab_size = tab_size;
+            settings.hard_tabs = hard_tabs;
+        }
 
         settings
     }
@@ -361,6 +366,11 @@ impl LanguageSettings {
 
         if let Some(modeline) = buffer.modeline() {
             merge_with_modeline(Arc::make_mut(&mut settings), modeline);
+        }
+        if let Some((tab_size, hard_tabs)) = buffer.indentation_override() {
+            let settings = Arc::make_mut(&mut settings);
+            settings.tab_size = tab_size;
+            settings.hard_tabs = hard_tabs;
         }
 
         settings

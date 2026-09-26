@@ -6154,6 +6154,7 @@ impl Window {
         action: &dyn Action,
         cx: &mut App,
     ) {
+        cx.notify_action_dispatch(action);
         self.dispatch_action_on_node_inner(node_id, action, cx);
 
         if !cx.propagate_event

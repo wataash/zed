@@ -1999,6 +1999,14 @@ mod tests {
             &[MigrationType::Json(
                 migrations::m_2025_10_17::make_file_finder_include_ignored_an_enum,
             )],
+            r#"{ "file_finder": { "include_ignored": "zall" } }"#,
+            None,
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_10_17::make_file_finder_include_ignored_an_enum,
+            )],
             indoc! {r#"
                 {
                     "file_finder": {

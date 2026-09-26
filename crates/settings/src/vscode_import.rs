@@ -196,6 +196,8 @@ impl VsCodeSettings {
             credentials_url: None,
             debugger: None,
             diagnostics: None,
+            disable_ai_in_directories: None,
+            enable_ai_in_directories: None,
             editor: self.editor_settings_content(),
             extension: ExtensionSettingsContent::default(),
             call_hierarchy: None,

@@ -232,6 +232,26 @@ pub struct SettingsContent {
     /// Configuration for Diagnostics-related features.
     pub diagnostics: Option<DiagnosticsSettingsContent>,
 
+    /// Enables AI for worktrees under the given directories, overriding `disable_ai`.
+    /// The deepest directory listed here or in `disable_ai_in_directories` wins.
+    /// Project settings cannot set this.
+    ///
+    /// Example: {"disable_ai": true, "enable_ai_in_directories": ["~/src/oss"]}
+    ///
+    /// Default: []
+    pub enable_ai_in_directories: Option<Vec<String>>,
+
+    /// Disables AI for worktrees under the given directories, overriding `disable_ai`.
+    /// The deepest directory listed here or in `enable_ai_in_directories` wins,
+    /// and this list wins for a directory listed in both.
+    /// While any open worktree resolves to disabled, AI is disabled everywhere,
+    /// as with `disable_ai` in project settings. Project settings cannot set this.
+    ///
+    /// Example: {"disable_ai_in_directories": ["~/secrets"]}
+    ///
+    /// Default: []
+    pub disable_ai_in_directories: Option<Vec<String>>,
+
     /// Configuration for Git-related features
     pub git: Option<GitSettings>,
 
@@ -404,6 +424,8 @@ fallible_options::flattened_deserialize!(SettingsContent {
     options: {
         call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
+        disable_ai_in_directories,
+        enable_ai_in_directories,
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
@@ -960,6 +982,11 @@ pub struct FileFinderSettingsContent {
     ///
     /// Default: false
     pub include_channels: Option<bool>,
+    /// Globs of paths to hide from file finder results, relative to each worktree root.
+    /// Matching directories are not walked when `include_ignored` is `zall`.
+    ///
+    /// Default: []
+    pub exclusions: Option<Vec<String>>,
 }
 
 #[derive(
@@ -985,6 +1012,8 @@ pub enum IncludeIgnoredContent {
     /// Be smart and search for ignored when called from a gitignored worktree
     #[default]
     Smart,
+    /// Use all gitignored files, walking directories Zed has not indexed
+    Zall,
 }
 
 #[derive(

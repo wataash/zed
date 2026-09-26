@@ -31,6 +31,7 @@ use itertools::Itertools;
 use language::{Buffer, Language};
 use menu::Confirm;
 use multi_buffer;
+use open_path_prompt::file_finder_settings::FileFinderSettings;
 use project::{
     Project, ProjectPath, SearchResults,
     search::{SearchInputKind, SearchQuery, SearchResult},
@@ -54,7 +55,10 @@ use ui::{
     CommonAnimationExt, IconButtonShape, KeyBinding, Toggleable, Tooltip, prelude::*,
     utils::SearchInputWidth,
 };
-use util::{ResultExt as _, paths::PathMatcher};
+use util::{
+    ResultExt as _,
+    paths::{PathMatcher, PathStyle},
+};
 use workspace::{
     DeploySearch, ItemNavHistory, NewSearch, ToolbarItemEvent, ToolbarItemLocation,
     ToolbarItemView, Workspace, WorkspaceId,
@@ -606,6 +610,7 @@ impl ProjectSearch {
         let Some(query) = self.active_query.clone() else {
             return;
         };
+        let file_finder_exclusions = file_finder_exclusion_globs(cx);
         self.project.update(cx, |project, _| {
             project
                 .search_history_mut(SearchInputKind::Query)
@@ -616,7 +621,12 @@ impl ProjectSearch {
                     .search_history_mut(SearchInputKind::Include)
                     .add(&mut self.search_included_history_cursor, included);
             }
-            let excluded = query.as_inner().files_to_exclude().sources().join(",");
+            let excluded = query
+                .as_inner()
+                .files_to_exclude()
+                .sources()
+                .filter(|source| !file_finder_exclusions.iter().any(|glob| glob == source))
+                .join(",");
             if !excluded.is_empty() {
                 project
                     .search_history_mut(SearchInputKind::Exclude)
@@ -1283,6 +1293,45 @@ impl Item for ProjectSearchView {
             _ => {}
         }
     }
+}
+
+/// `file_finder.exclusions` expanded to also match files below excluded directories,
+/// and paths prefixed with a worktree root name (used when several worktrees are open).
+fn file_finder_exclusion_globs(cx: &App) -> Vec<String> {
+    FileFinderSettings::get_global(cx)
+        .exclusions
+        .sources()
+        .flat_map(|glob| {
+            let glob = glob.trim_end_matches('/');
+            [
+                glob.to_string(),
+                format!("{glob}/**"),
+                format!("*/{glob}"),
+                format!("*/{glob}/**"),
+            ]
+        })
+        .collect()
+}
+
+/// Excludes `file_finder.exclusions`, so project search covers the same files as the file finder.
+fn with_file_finder_exclusions(
+    excluded: PathMatcher,
+    path_style: PathStyle,
+    cx: &App,
+) -> PathMatcher {
+    let file_finder_exclusions = file_finder_exclusion_globs(cx);
+    if file_finder_exclusions.is_empty() {
+        return excluded;
+    }
+    let globs = excluded
+        .sources()
+        .map(str::to_string)
+        .chain(file_finder_exclusions)
+        .collect::<Vec<_>>();
+    PathMatcher::new(&globs, path_style)
+        .context("Failed to combine file_finder.exclusions with search exclusions")
+        .log_err()
+        .unwrap_or(excluded)
 }
 
 impl ProjectSearchView {
@@ -2151,6 +2200,8 @@ impl ProjectSearchView {
             .count()
             > 1;
 
+        let path_style = self.entity.read(cx).project.read(cx).path_style(cx);
+        let excluded_files = with_file_finder_exclusions(excluded_files, path_style, cx);
         let query = match self.search_options.build_query(
             text,
             included_files,
@@ -2202,8 +2253,12 @@ impl ProjectSearchView {
     /// to a default (match-all) matcher. Shared with the text finder, which is
     /// backed by the same view.
     pub(crate) fn file_path_filters(&self, cx: &App) -> (PathMatcher, PathMatcher) {
+        let path_style = self.entity.read(cx).project.read(cx).path_style(cx);
         if !self.filters_enabled {
-            return (PathMatcher::default(), PathMatcher::default());
+            return (
+                PathMatcher::default(),
+                with_file_finder_exclusions(PathMatcher::default(), path_style, cx),
+            );
         }
         let included = self
             .parse_path_matches(self.included_files_editor.read(cx).text(cx), cx)
@@ -2211,7 +2266,10 @@ impl ProjectSearchView {
         let excluded = self
             .parse_path_matches(self.excluded_files_editor.read(cx).text(cx), cx)
             .unwrap_or_default();
-        (included, excluded)
+        (
+            included,
+            with_file_finder_exclusions(excluded, path_style, cx),
+        )
     }
 
     fn parse_path_matches(&self, text: String, cx: &App) -> anyhow::Result<PathMatcher> {
@@ -3717,6 +3775,70 @@ pub mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[gpui::test]
+    async fn test_file_finder_exclusions_apply_to_project_search(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                ".git": {},
+                ".gitignore": "target\n",
+                "a.txt": "hello",
+                "target": { "b.txt": "hello" },
+                "vendor": { "c.txt": "hello" },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let search = cx.new(|cx| ProjectSearch::new(project.clone(), workspace.downgrade(), cx));
+        let search_view = cx.add_window(|window, cx| {
+            ProjectSearchView::new(workspace.downgrade(), search, window, cx, None)
+        });
+        search_view
+            .update(cx, |search_view, _, cx| {
+                search_view.toggle_search_option(SearchOptions::INCLUDE_IGNORED, cx);
+            })
+            .unwrap();
+        let match_count = |cx: &mut TestAppContext| {
+            search_view
+                .update(cx, |search_view, _, cx| {
+                    search_view.entity.read(cx).match_ranges.len()
+                })
+                .unwrap()
+        };
+
+        perform_search(search_view, "hello", cx);
+        assert_eq!(match_count(cx), 3);
+
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.file_finder.get_or_insert_default().exclusions =
+                        Some(vec!["**/target".to_string(), "vendor".to_string()]);
+                });
+            });
+        });
+        perform_search(search_view, "hello", cx);
+        assert_eq!(
+            match_count(cx),
+            1,
+            "Files below file_finder.exclusions are not searched"
+        );
+        project.update(cx, |project, _| {
+            assert_eq!(
+                project.search_history(SearchInputKind::Exclude).len(),
+                0,
+                "file_finder.exclusions are not recorded as typed exclusions"
+            );
+        });
     }
 
     #[perf]

@@ -39223,6 +39223,273 @@ async fn test_add_selection_skip_soft_wrap_option(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_set_indentation(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        build_editor(buffer, window, cx)
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    cx.set_state("ˇ");
+    cx.update_editor(|editor, window, cx| {
+        editor.set_indentation(
+            &SetIndentation {
+                tab_size: 3,
+                hard_tabs: false,
+            },
+            window,
+            cx,
+        );
+        assert_eq!(editor.buffer.read(cx).snapshot(cx).text(), "");
+        editor.indent(&Indent, window, cx);
+    });
+    cx.assert_editor_state("   ˇ");
+    cx.update_editor(|editor, window, cx| {
+        editor.undo(&Undo, window, cx);
+        editor.set_indentation(
+            &SetIndentation {
+                tab_size: 8,
+                hard_tabs: true,
+            },
+            window,
+            cx,
+        );
+        editor.indent(&Indent, window, cx);
+    });
+    cx.assert_editor_state("\tˇ");
+    cx.update_editor(|editor, window, cx| {
+        editor.undo(&Undo, window, cx);
+        editor.set_indentation(
+            &SetIndentation {
+                tab_size: 0,
+                hard_tabs: false,
+            },
+            window,
+            cx,
+        );
+        editor.indent(&Indent, window, cx);
+    });
+    cx.assert_editor_state("\tˇ");
+}
+
+#[gpui::test]
+async fn test_personal_selection_actions(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        build_editor(buffer, window, cx)
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    let original = "«1+2ˇ»\n«2*3ˇ»";
+    cx.set_state(original);
+    cx.update_editor(|editor, window, cx| {
+        editor.calculate_selection(&CalculateSelection, window, cx)
+    });
+    cx.assert_editor_state("3.00ˇ\n6.00ˇ");
+    cx.update_editor(|editor, window, cx| editor.undo(&Undo, window, cx));
+    cx.assert_editor_state(original);
+    cx.update_editor(|editor, window, cx| editor.redo(&Redo, window, cx));
+    cx.assert_editor_state("3.00ˇ\n6.00ˇ");
+    cx.set_state("«1+2ˇ»\n«invalidˇ»");
+    cx.update_editor(|editor, window, cx| {
+        editor.calculate_selection(&CalculateSelection, window, cx)
+    });
+    cx.assert_editor_state("«1+2ˇ»\n«invalidˇ»");
+    cx.set_state("«a\naˇ»\n«b\nbˇ»");
+    cx.update_editor(|editor, window, cx| editor.uniq_selection(&UniqSelection, window, cx));
+    cx.assert_editor_state("aˇ\nbˇ");
+    cx.set_state("«1+2/3ˇ»");
+    cx.update_editor(|editor, window, cx| {
+        editor.precise_calculation(&PreciseCalculation, window, cx)
+    });
+    cx.assert_editor_state("1.6666666666666665ˇ");
+    cx.set_state(original);
+    cx.update_editor(|editor, window, cx| {
+        editor.set_read_only(true);
+        editor.calculate_selection(&CalculateSelection, window, cx);
+    });
+    cx.assert_editor_state(original);
+}
+
+#[gpui::test]
+async fn test_personal_clipboard_and_sort_actions(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        build_editor(buffer, window, cx)
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    cx.set_state("```\n日本語ˇ\n```\n");
+    cx.update_editor(|editor, window, cx| {
+        editor.copy_current_code_block(&CopyCurrentCodeBlock, window, cx);
+        let clipboard = cx.read_from_clipboard().expect("copied text");
+        assert!(matches!(clipboard.entries().first(), Some(ClipboardEntry::String(text)) if text.text() == "日本語"));
+    });
+    cx.set_state("ˇ\n«replaceˇ»");
+    cx.update_editor(|editor, window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string("/tmp/日本語 a".into()));
+        editor.insert_clipboard_file_uri(&InsertClipboardFileUri, window, cx);
+    });
+    cx.assert_editor_state("file:///tmp/日本語 aˇ\nfile:///tmp/日本語 aˇ");
+    cx.update_editor(|editor, window, cx| editor.undo(&Undo, window, cx));
+    cx.assert_editor_state("ˇ\n«replaceˇ»");
+    cx.set_state("«a\nc\nBˇ»\nuntouched");
+    cx.update_editor(|editor, window, cx| {
+        editor.sort_lines_descending(&SortLinesDescending, window, cx)
+    });
+    assert_eq!(cx.buffer_text(), "c\na\nB\nuntouched");
+}
+
+#[gpui::test]
+async fn test_personal_selection_actions_skip_unchanged_text(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        build_editor(buffer, window, cx)
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+
+    // Nothing to deduplicate: no edit is recorded and the selections stay as they were.
+    let unchanged = "«a\nbˇ»\n«cˇ»";
+    cx.set_state(unchanged);
+    let buffer_version = |editor: &Editor, cx: &App| {
+        editor
+            .buffer
+            .read(cx)
+            .as_singleton()
+            .expect("singleton buffer")
+            .read(cx)
+            .version()
+    };
+    let version_before = cx.update_editor(|editor, _, cx| buffer_version(editor, cx));
+    cx.update_editor(|editor, window, cx| editor.uniq_selection(&UniqSelection, window, cx));
+    cx.assert_editor_state(unchanged);
+    cx.update_editor(|editor, _, cx| assert_eq!(buffer_version(editor, cx), version_before));
+
+    // Mixed: only the duplicated selection is edited and its cursor collapses after the result;
+    // the untouched selection is kept, and a single undo restores everything.
+    let mixed = "«aˇ»\n«b\nbˇ»\n«cˇ»";
+    cx.set_state(mixed);
+    cx.update_editor(|editor, window, cx| editor.uniq_selection(&UniqSelection, window, cx));
+    cx.assert_editor_state("«aˇ»\nbˇ\n«cˇ»");
+    cx.update_editor(|editor, window, cx| editor.undo(&Undo, window, cx));
+    cx.assert_editor_state(mixed);
+}
+
+#[gpui::test]
+async fn test_tilix_directory(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/root"), json!({ "a.txt": "" })).await;
+    fs.insert_tree(path!("/home"), json!({ "single.txt": "" }))
+        .await;
+
+    // A single-file worktree resolves to the file's parent directory, not the file itself.
+    let project = Project::test(fs.clone(), [path!("/home/single.txt").as_ref()], cx).await;
+    project.read_with(cx, |project, cx| {
+        assert_eq!(
+            Editor::tilix_directory_for_project(project, cx),
+            Some(PathBuf::from(path!("/home")))
+        );
+    });
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        Editor::for_multibuffer(buffer, Some(project.clone()), window, cx)
+    });
+    editor.read_with(cx, |editor, cx| {
+        assert_eq!(
+            editor.tilix_directory(cx),
+            Some(PathBuf::from(path!("/home"))),
+            "an untitled buffer falls back to the project directory"
+        );
+    });
+
+    // A directory worktree is used as is, and the editor's own file directory takes priority.
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    project.read_with(cx, |project, cx| {
+        assert_eq!(
+            Editor::tilix_directory_for_project(project, cx),
+            Some(PathBuf::from(path!("/root")))
+        );
+    });
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/home/single.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        Editor::for_buffer(buffer, Some(project.clone()), window, cx)
+    });
+    editor.read_with(cx, |editor, cx| {
+        assert_eq!(
+            editor.tilix_directory(cx),
+            Some(PathBuf::from(path!("/home")))
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_insert_date_time(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        build_editor(buffer, window, cx)
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    let original = "日本語«置換ˇ»\n日時ˇ";
+    cx.set_state(original);
+    let before = chrono::Local::now().timestamp();
+    cx.update_editor(|editor, window, cx| editor.insert_date_time(&InsertDateTime, window, cx));
+    let after = chrono::Local::now().timestamp();
+    let text = cx.buffer_text();
+    let timestamp = text
+        .lines()
+        .next()
+        .expect("first line")
+        .strip_prefix("日本語")
+        .expect("unchanged prefix");
+    assert!((before..=after).any(|seconds| {
+        chrono::DateTime::from_timestamp(seconds, 0)
+            .expect("valid current timestamp")
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %a %H:%M:%S")
+            .to_string()
+            == timestamp
+    }));
+    cx.assert_editor_state(&format!("日本語{timestamp}ˇ\n日時{timestamp}ˇ"));
+    cx.update_editor(|editor, window, cx| editor.undo(&Undo, window, cx));
+    cx.assert_editor_state(original);
+    cx.update_editor(|editor, window, cx| editor.redo(&Redo, window, cx));
+    cx.assert_editor_state(&format!("日本語{timestamp}ˇ\n日時{timestamp}ˇ"));
+    cx.update_editor(|editor, _, _| editor.set_read_only(true));
+    cx.update_editor(|editor, window, cx| editor.insert_date_time(&InsertDateTime, window, cx));
+    assert_eq!(cx.buffer_text(), text);
+}
+
+#[gpui::test]
+async fn test_insert_date(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        build_editor(buffer, window, cx)
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    cx.set_state("ˇ");
+    let before = chrono::Local::now().format("%Y-%m-%d %a").to_string();
+    cx.update_editor(|editor, window, cx| editor.insert_date(&InsertDate, window, cx));
+    let after = chrono::Local::now().format("%Y-%m-%d %a").to_string();
+    let text = cx.buffer_text();
+    assert!(text == before || text == after);
+    cx.assert_editor_state(&format!("{text}ˇ"));
+    cx.update_editor(|editor, window, cx| editor.undo(&Undo, window, cx));
+    cx.assert_editor_state("ˇ");
+    cx.update_editor(|editor, _, _| editor.set_read_only(true));
+    cx.update_editor(|editor, window, cx| editor.insert_date(&InsertDate, window, cx));
+    cx.assert_editor_state("ˇ");
+}
+
+#[gpui::test]
 async fn test_insert_snippet(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     let mut cx = EditorTestContext::new(cx).await;
@@ -40212,16 +40479,22 @@ async fn test_paste_image_in_markdown_saves_file_and_inserts_markdown(cx: &mut T
 
     let buffer_text = cx.buffer_text();
     assert!(
-        buffer_text.starts_with("![](image") && buffer_text.ends_with(".png)"),
+        buffer_text.starts_with("![](") && buffer_text.ends_with(")"),
         "expected markdown image syntax, got: {buffer_text:?}"
     );
 
     // Cursor should land inside [] so the user can type alt text immediately.
-    let filename_in_parens = &buffer_text["![](".len()..buffer_text.len() - 1];
-    let expected_state = format!("![ˇ]({filename_in_parens})");
-    cx.assert_editor_state(&expected_state);
-
     let filename = &buffer_text["![](".len()..buffer_text.len() - 1];
+    cx.assert_editor_state(&format!("![ˇ]({filename})"));
+
+    // `{document stem}.{UTC YYMMDDhhmmss}.{extension}`, as in VS Code's
+    // `markdown.copyFiles.destination`. The exact timestamp depends on when
+    // the test runs, so only its shape is checked.
+    let filename_pattern = regex::Regex::new(r"^test\.\d{12}\.png$").unwrap();
+    assert!(
+        filename_pattern.is_match(filename),
+        "unexpected image filename: {filename:?}"
+    );
     assert_eq!(
         fs.read_file_sync(format!("/test/{filename}")).unwrap(),
         png_bytes,
@@ -40268,52 +40541,70 @@ async fn test_paste_multiple_images_in_markdown_increments_filename(cx: &mut Tes
     cx.run_until_parked();
     let mut cx = EditorTestContext::for_editor(editor_window, cx).await;
 
-    let png_bytes_1: Vec<u8> = vec![1, 2, 3, 4, 5];
-    let png_bytes_2: Vec<u8> = vec![6, 7, 8, 9, 10];
-    let png_bytes_3: Vec<u8> = vec![11, 12, 13, 14, 15];
-    let image_1 = gpui::Image::from_bytes(gpui::ImageFormat::Png, png_bytes_1.clone());
-    let image_2 = gpui::Image::from_bytes(gpui::ImageFormat::Png, png_bytes_2.clone());
-    let image_3 = gpui::Image::from_bytes(gpui::ImageFormat::Png, png_bytes_3.clone());
+    // Pasting several images in a row must never overwrite an earlier one. When
+    // pastes share a timestamp the name gets `_1`, `_2`, ... before the
+    // extension; when the clock ticks over between pastes the timestamps
+    // differ instead. Either way every paste gets its own file.
+    let filename_pattern = regex::Regex::new(r"^(test\.\d{12})(?:_(\d+))?\.png$").unwrap();
+    let link_pattern = regex::Regex::new(r"!\[[^\]]*\]\(([^()]*)\)").unwrap();
 
-    // Paste first image — should produce image.png
     cx.set_state("ˇ");
-    cx.update_editor(|editor, window, cx| {
-        cx.write_to_clipboard(ClipboardItem::new_image(&image_1));
-        editor.paste(&Paste, window, cx);
-    });
-    cx.run_until_parked();
-    let text_after_first = cx.buffer_text();
-    assert_eq!(
-        text_after_first, "![](image.png)",
-        "first paste should produce image.png"
-    );
-    assert_eq!(fs.read_file_sync("/test/image.png").unwrap(), png_bytes_1);
+    let mut filenames: Vec<String> = Vec::new();
+    for png_bytes in [vec![1, 2, 3, 4, 5], vec![6, 7, 8, 9, 10], vec![11, 12, 13]] {
+        let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, png_bytes.clone());
+        cx.update_editor(|editor, window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_image(&image));
+            editor.paste(&Paste, window, cx);
+        });
+        cx.run_until_parked();
 
-    // Paste second image at end — should produce image_1.png
-    cx.update_editor(|editor, window, cx| {
-        cx.write_to_clipboard(ClipboardItem::new_image(&image_2));
-        editor.paste(&Paste, window, cx);
-    });
-    cx.run_until_parked();
-    let text_after_second = cx.buffer_text();
-    assert!(
-        text_after_second.contains("![](image_1.png)"),
-        "second paste should produce image_1.png, got: {text_after_second:?}"
-    );
-    assert_eq!(fs.read_file_sync("/test/image_1.png").unwrap(), png_bytes_2);
+        let buffer_text = cx.buffer_text();
+        let new_filenames: Vec<String> = link_pattern
+            .captures_iter(&buffer_text)
+            .map(|captures| captures[1].to_string())
+            .filter(|filename| !filenames.contains(filename))
+            .collect();
+        assert_eq!(
+            new_filenames.len(),
+            1,
+            "each paste should insert exactly one new image link, got: {buffer_text:?}"
+        );
+        let filename = new_filenames.into_iter().next().unwrap();
+        assert!(
+            filename_pattern.is_match(&filename),
+            "unexpected image filename: {filename:?}"
+        );
+        assert_eq!(
+            fs.read_file_sync(format!("/test/{filename}")).unwrap(),
+            png_bytes,
+            "{filename} should contain the bytes of the paste that created it"
+        );
+        filenames.push(filename);
+    }
 
-    // Paste third image — should produce image_2.png
-    cx.update_editor(|editor, window, cx| {
-        cx.write_to_clipboard(ClipboardItem::new_image(&image_3));
-        editor.paste(&Paste, window, cx);
-    });
-    cx.run_until_parked();
-    let text_after_third = cx.buffer_text();
-    assert!(
-        text_after_third.contains("![](image_2.png)"),
-        "third paste should produce image_2.png, got: {text_after_third:?}"
-    );
-    assert_eq!(fs.read_file_sync("/test/image_2.png").unwrap(), png_bytes_3);
+    // Within a run of pastes that share a timestamp, the counter must count up
+    // from `_1` without gaps.
+    for pair in filenames.windows(2) {
+        let previous = filename_pattern.captures(&pair[0]).unwrap();
+        let current = filename_pattern.captures(&pair[1]).unwrap();
+        if previous[1] != current[1] {
+            continue;
+        }
+        let counter = |captures: &regex::Captures<'_>| -> u32 {
+            captures
+                .get(2)
+                .map_or(0, |counter| counter.as_str().parse().unwrap())
+        };
+        assert_eq!(
+            counter(&current),
+            counter(&previous) + 1,
+            "expected {:?} to be followed by {}_{}.png, got {:?}",
+            pair[0],
+            &previous[1],
+            counter(&previous) + 1,
+            pair[1]
+        );
+    }
 }
 
 #[gpui::test]
@@ -40422,8 +40713,9 @@ async fn test_paste_image_in_markdown_single_file_worktree_falls_through(cx: &mu
     cx.run_until_parked();
 
     cx.assert_editor_state("ˇ");
-    assert!(
-        fs.read_file_sync("/root/image.png").is_err(),
+    assert_eq!(
+        fs.files(),
+        vec![PathBuf::from("/root/test.md")],
         "no image file should be created for a single-file worktree"
     );
 }

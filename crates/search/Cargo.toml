@@ -35,6 +35,7 @@ language.workspace = true
 log.workspace = true
 menu.workspace = true
 multi_buffer.workspace = true
+open_path_prompt.workspace = true
 picker.workspace = true
 picker_preview.workspace = true
 project.workspace = true
