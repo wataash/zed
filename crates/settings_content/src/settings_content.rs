@@ -196,6 +196,9 @@ pub struct SettingsContent {
     /// Settings related to the file finder.
     pub file_finder: Option<FileFinderSettingsContent>,
 
+    /// Custom build settings.
+    pub zhack: Option<ZhackSettingsContent>,
+
     pub call_hierarchy: Option<CallHierarchySettingsContent>,
 
     pub git_panel: Option<GitPanelSettingsContent>,
@@ -231,6 +234,26 @@ pub struct SettingsContent {
 
     /// Configuration for Diagnostics-related features.
     pub diagnostics: Option<DiagnosticsSettingsContent>,
+
+    /// Enables AI for worktrees under the given directories, overriding `disable_ai`.
+    /// The deepest directory listed here or in `disable_ai_in_directories` wins.
+    /// Project settings cannot set this.
+    ///
+    /// Example: {"disable_ai": true, "enable_ai_in_directories": ["~/src/oss"]}
+    ///
+    /// Default: []
+    pub enable_ai_in_directories: Option<Vec<String>>,
+
+    /// Disables AI for worktrees under the given directories, overriding `disable_ai`.
+    /// The deepest directory listed here or in `enable_ai_in_directories` wins,
+    /// and this list wins for a directory listed in both.
+    /// While any open worktree resolves to disabled, AI is disabled everywhere,
+    /// as with `disable_ai` in project settings. Project settings cannot set this.
+    ///
+    /// Example: {"disable_ai_in_directories": ["~/secrets"]}
+    ///
+    /// Default: []
+    pub disable_ai_in_directories: Option<Vec<String>>,
 
     /// Configuration for Git-related features
     pub git: Option<GitSettings>,
@@ -402,8 +425,10 @@ impl SettingsContent {
 fallible_options::flattened_deserialize!(SettingsContent {
     sections: { project, theme, extension, workspace, editor, remote },
     options: {
-        call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
+        call_hierarchy, command_palette, file_finder, zhack, git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
+        disable_ai_in_directories,
+        enable_ai_in_directories,
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
@@ -934,6 +959,27 @@ pub struct CommandPaletteSettingsContent {
     ///
     /// Default: true
     pub use_command_history: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct ZhackSettingsContent {
+    /// Directory globs excluded from native Linux watches, relative to the worktree
+    /// root (or absolute for external paths). Includes Git metadata watches.
+    /// Does not exclude files from scanning or display. Default: []
+    pub watch_exclusions: Option<SplicingVec>,
+    pub search: Option<ZhackSearchSettingsContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct ZhackSearchSettingsContent {
+    /// Include ignored files in the file finder, walking directories not yet indexed.
+    /// Default: false
+    pub all_files: Option<bool>,
+    /// Globs excluded from file finder results, history, and project search.
+    /// Paths are relative to each worktree root. Default: []
+    pub exclusions: Option<SplicingVec>,
 }
 
 #[with_fallible_options]

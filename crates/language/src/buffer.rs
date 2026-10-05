@@ -139,6 +139,7 @@ pub struct Buffer {
     has_unsaved_edits: Cell<(clock::Global, bool)>,
     change_bits: Vec<rc::Weak<Cell<bool>>>,
     modeline: Option<Arc<ModelineSettings>>,
+    indentation_override: Option<(NonZeroU32, bool)>,
     _subscriptions: Vec<gpui::Subscription>,
     resolved_settings: Option<Arc<LanguageSettings>>,
     _settings_observer: Option<gpui::Subscription>,
@@ -202,6 +203,7 @@ pub struct BufferSnapshot {
     non_text_state_update_count: usize,
     pub capability: Capability,
     modeline: Option<Arc<ModelineSettings>>,
+    indentation_override: Option<(NonZeroU32, bool)>,
     resolved_settings: Option<Arc<LanguageSettings>>,
 }
 
@@ -1188,6 +1190,7 @@ impl Buffer {
             has_conflict: false,
             change_bits: Default::default(),
             modeline: None,
+            indentation_override: None,
             _subscriptions: Vec::new(),
             resolved_settings: None,
             _settings_observer: Some(cx.observe_global::<SettingsStore>(|this, cx| {
@@ -1252,6 +1255,7 @@ impl Buffer {
                 non_text_state_update_count: 0,
                 capability: Capability::ReadOnly,
                 modeline,
+                indentation_override: None,
                 resolved_settings: None,
             }
         }
@@ -1280,6 +1284,7 @@ impl Buffer {
             non_text_state_update_count: 0,
             capability: Capability::ReadOnly,
             modeline: None,
+            indentation_override: None,
             resolved_settings: None,
         }
     }
@@ -1312,6 +1317,7 @@ impl Buffer {
             non_text_state_update_count: 0,
             capability: Capability::ReadOnly,
             modeline: None,
+            indentation_override: None,
             resolved_settings: None,
         }
     }
@@ -1344,6 +1350,7 @@ impl Buffer {
             non_text_state_update_count: self.non_text_state_update_count,
             capability: self.capability,
             modeline: self.modeline.clone(),
+            indentation_override: self.indentation_override,
             resolved_settings: self.resolved_settings.clone(),
         }
     }
@@ -1608,6 +1615,17 @@ impl Buffer {
         );
     }
 
+    /// Overrides indentation for this buffer's lifetime without editing its text or settings files.
+    pub fn set_indentation(
+        &mut self,
+        tab_size: NonZeroU32,
+        hard_tabs: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.indentation_override = Some((tab_size, hard_tabs));
+        self.refresh_resolved_settings(cx);
+    }
+
     /// Assign the buffer [`ModelineSettings`].
     pub fn set_modeline(
         &mut self,
@@ -1621,6 +1639,10 @@ impl Buffer {
         } else {
             false
         }
+    }
+
+    pub(crate) fn indentation_override(&self) -> Option<(NonZeroU32, bool)> {
+        self.indentation_override
     }
 
     /// Returns the [`ModelineSettings`].
@@ -4364,6 +4386,10 @@ impl BufferSnapshot {
             })
     }
 
+    pub(crate) fn indentation_override(&self) -> Option<(NonZeroU32, bool)> {
+        self.indentation_override
+    }
+
     /// Returns the [`ModelineSettings`].
     pub fn modeline(&self) -> Option<&Arc<ModelineSettings>> {
         self.modeline.as_ref()
@@ -5626,6 +5652,7 @@ impl Clone for BufferSnapshot {
             non_text_state_update_count: self.non_text_state_update_count,
             capability: self.capability,
             modeline: self.modeline.clone(),
+            indentation_override: self.indentation_override,
             resolved_settings: self.resolved_settings.clone(),
         }
     }

@@ -11,6 +11,7 @@ pub struct WorktreeSettings {
     /// Whether to prevent this project from being shared in public channels.
     pub prevent_sharing_in_public_channels: bool,
     pub file_scan_exclusions: PathMatcher,
+    pub watch_exclusions: PathMatcher,
     pub file_scan_inclusions: PathMatcher,
     /// This field contains all ancestors of the `file_scan_inclusions`. It's used to
     /// determine whether to terminate worktree scanning for a given dir.
@@ -69,6 +70,15 @@ impl Settings for WorktreeSettings {
 
         Self {
             prevent_sharing_in_public_channels: worktree.prevent_sharing_in_public_channels,
+            watch_exclusions: valid_path_matchers(
+                content
+                    .zhack
+                    .as_ref()
+                    .and_then(|zhack| zhack.watch_exclusions.as_ref())
+                    .map(|exclusions| exclusions.0.clone())
+                    .unwrap_or_default(),
+                "zhack.watch_exclusions",
+            ),
             file_scan_exclusions: valid_path_matchers(file_scan_exclusions, "file_scan_exclusions"),
             parent_dir_scan_inclusions,
             file_scan_inclusions,

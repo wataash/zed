@@ -11,8 +11,8 @@ use anyhow::Context as _;
 use gpui::{
     AnyElement, App, AsyncWindowContext, Bounds, Context, Entity, Focusable as _, FontWeight, Hsla,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollHandle, Size,
-    StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, TaskExt,
-    TextStyleRefinement, Window, canvas, div, px,
+    StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, TextStyleRefinement,
+    Window, canvas, div, px,
 };
 use language::{DiagnosticEntry, Language, LanguageRegistry};
 use lsp::DiagnosticSeverity;
@@ -30,7 +30,7 @@ use theme_settings::ThemeSettings;
 use ui::{CopyButton, Scrollbars, WithScrollbar, prelude::*, theme_is_transparent};
 use url::Url;
 use util::TryFutureExt;
-use workspace::{OpenOptions, OpenVisible, Workspace};
+use workspace::{OpenOptions, OpenVisible, Workspace, notifications::NotifyTaskExt as _};
 
 pub const MIN_POPOVER_CHARACTER_WIDTH: f32 = 20.;
 pub const MIN_POPOVER_LINE_HEIGHT: f32 = 4.;
@@ -1066,7 +1066,7 @@ pub fn open_markdown_url(
                     });
                 })
             })
-            .detach_and_log_err(cx);
+            .detach_and_notify_err(cx.entity().downgrade(), window, cx);
         });
         return;
     }

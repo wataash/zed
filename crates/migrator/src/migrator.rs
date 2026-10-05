@@ -257,6 +257,7 @@ pub fn migrate_settings(text: &str) -> Result<Option<String>> {
         MigrationType::Json(migrations::m_2026_08_26::rename_folder_icons_to_folder_indicator),
         MigrationType::Json(migrations::m_2026_08_30::nest_markdown_preview_settings),
         MigrationType::Json(migrations::m_2026_09_16::nest_agent_threads_sidebar_settings),
+        MigrationType::Json(migrations::zhack::move_search_settings),
     ];
     run_migrations(text, migrations)
 }
@@ -1993,6 +1994,14 @@ mod tests {
                 migrations::m_2025_10_17::make_file_finder_include_ignored_an_enum,
             )],
             r#"{ }"#,
+            None,
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_10_17::make_file_finder_include_ignored_an_enum,
+            )],
+            r#"{ "file_finder": { "include_ignored": "zall" } }"#,
             None,
         );
 

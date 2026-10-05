@@ -1586,6 +1586,132 @@ async fn test_root_rescan_keeps_root_watcher_registered(cx: &mut TestAppContext)
     assert_eq!(root_watch_calls, 1);
 }
 
+#[cfg(target_os = "linux")]
+#[gpui::test]
+async fn test_zhack_watch_exclusions_keep_entries_and_reconfigure(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    let recording = fs
+        .record_watcher_diagnostics()
+        .expect("fake watcher diagnostics");
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".git": {"objects": {"ab": {"object": ""}}, "refs": {"heads": {"main": ""}}},
+            "src": {"main.rs": ""}
+        }),
+    )
+    .await;
+    fs.create_symlink(Path::new("/root/alias"), PathBuf::from(".git/objects"))
+        .await
+        .expect("internal symlink");
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions = Some(SplicingVec::from(vec![]));
+                settings.project.worktree.file_scan_inclusions =
+                    Some(SplicingVec::from(vec!["**/.git/**".to_string()]));
+                settings.project.worktree.scan_symlinks =
+                    Some(settings::ScanSymlinksSetting::Always);
+                settings.zhack.get_or_insert_default().watch_exclusions =
+                    Some(SplicingVec::from(vec!["**/.git".to_string()]));
+            });
+        });
+    });
+    let tree = Worktree::local(
+        Path::new("/root"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .expect("worktree");
+    cx.read(|cx| {
+        tree.read(cx)
+            .as_local()
+            .expect("local worktree")
+            .scan_complete()
+    })
+    .await;
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            tree.entry_for_path(rel_path(".git/objects/ab/object"))
+                .is_some()
+        );
+    });
+    let watched_paths = || {
+        recording
+            .snapshot()
+            .watchers
+            .into_iter()
+            .flat_map(|watcher| {
+                watcher
+                    .roots
+                    .into_iter()
+                    .map(|root| PathBuf::from(root.path))
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(watched_paths().contains(&PathBuf::from("/root/src")));
+    assert!(
+        !watched_paths()
+            .iter()
+            .any(|path| path.starts_with("/root/.git"))
+    );
+    assert!(
+        !fs.watch_calls()
+            .iter()
+            .any(|path| path.starts_with("/root/.git"))
+    );
+    assert!(
+        !fs.watch_calls()
+            .iter()
+            .any(|path| path.starts_with("/root/alias"))
+    );
+
+    for exclude in [false, true] {
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.zhack.get_or_insert_default().watch_exclusions =
+                        Some(SplicingVec::from(if exclude {
+                            vec!["**/.git".to_string()]
+                        } else {
+                            vec![]
+                        }));
+                });
+            });
+        });
+        cx.executor().run_until_parked();
+        cx.read(|cx| {
+            tree.read(cx)
+                .as_local()
+                .expect("local worktree")
+                .scan_complete()
+        })
+        .await;
+        let watched = watched_paths();
+        assert_eq!(
+            watched.contains(&PathBuf::from("/root/.git/objects/ab")),
+            !exclude
+        );
+        assert_eq!(
+            watched.contains(&PathBuf::from("/root/.git/refs/heads")),
+            !exclude
+        );
+        assert!(watched.contains(&PathBuf::from("/root/src")));
+        tree.read_with(cx, |tree, _| {
+            assert!(
+                tree.entry_for_path(rel_path(".git/objects/ab/object"))
+                    .is_some()
+            );
+        });
+    }
+}
+
 #[gpui::test]
 async fn test_subtree_rescan_reports_unchanged_descendants_as_updated(cx: &mut TestAppContext) {
     init_test(cx);

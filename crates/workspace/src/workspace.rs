@@ -25,6 +25,7 @@ pub mod tasks;
 mod theme_preview;
 mod toast_layer;
 mod toolbar;
+mod video_links;
 pub mod welcome;
 pub mod workspace_error;
 mod workspace_settings;
@@ -4188,6 +4189,33 @@ impl Workspace {
         })
     }
 
+    /// Open local video links with the system player instead of creating an editor tab.
+    pub fn open_video_link_with_system(&self, path: &ResolvedPath, cx: &mut App) -> bool {
+        let project = self.project.read(cx);
+        if !project.is_local() {
+            return false;
+        }
+        let path = match path {
+            ResolvedPath::ProjectPath {
+                project_path,
+                is_dir: false,
+            } => project.absolute_path(project_path, cx),
+            ResolvedPath::AbsPath {
+                path,
+                is_dir: false,
+            } => Some(PathBuf::from(path)),
+            _ => None,
+        };
+        let Some(path) = path else {
+            return false;
+        };
+        if !video_links::should_open_with_system(&path, true, path.is_dir()) {
+            return false;
+        }
+        cx.open_with_system(&path);
+        true
+    }
+
     pub fn open_resolved_path(
         &mut self,
         path: ResolvedPath,
@@ -5171,7 +5199,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut open_abs_path = |this: &mut Self, path, cx: &mut _| {
+        let mut open_abs_path = |this: &mut Self, path: PathBuf, cx: &mut Context<Self>| {
+            if this.open_video_link_with_system(
+                &ResolvedPath::AbsPath {
+                    path: path.to_string_lossy().into_owned(),
+                    is_dir: false,
+                },
+                cx,
+            ) {
+                return;
+            }
             let url_or_path = url_or_path.to_owned();
             let task = this.open_abs_path(
                 path,
@@ -5194,7 +5231,10 @@ impl Workspace {
         if let Ok(url) = Url::parse(url_or_path) {
             match url.scheme() {
                 "http" | "https" => cx.open_url(url_or_path),
-                "file" => open_abs_path(self, PathBuf::from(url.path()), cx),
+                "file" => match url.to_file_path() {
+                    Ok(path) => open_abs_path(self, path, cx),
+                    Err(()) => cx.open_url(url_or_path),
+                },
                 _ => cx.open_url(url_or_path),
             }
             return;
@@ -5238,6 +5278,15 @@ impl Workspace {
                 .or_else(|| project.find_project_path(path, cx))
         });
         if let Some(project_path) = project_path {
+            if self.open_video_link_with_system(
+                &ResolvedPath::ProjectPath {
+                    project_path: project_path.clone(),
+                    is_dir: false,
+                },
+                cx,
+            ) {
+                return;
+            }
             let url_or_path = url_or_path.to_owned();
             let task = self.open_path(project_path, None, true, window, cx);
             (**cx)
@@ -19846,6 +19895,16 @@ mod tests {
                 PathBuf::from(path!("/project/renamed/a.rs")),
             ]
         );
+    }
+
+    #[test]
+    fn test_video_file_url_preserves_encoded_path() {
+        let url = Url::from_file_path(path!("/media/session clip.MP4"))
+            .expect("absolute local file path");
+        assert!(url.as_str().contains("%20"));
+        let path = url.to_file_path().expect("local file URL");
+        assert_eq!(path, PathBuf::from(path!("/media/session clip.MP4")));
+        assert!(video_links::should_open_with_system(&path, true, false));
     }
 
     #[gpui::test]

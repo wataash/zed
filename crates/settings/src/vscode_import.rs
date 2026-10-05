@@ -196,10 +196,13 @@ impl VsCodeSettings {
             credentials_url: None,
             debugger: None,
             diagnostics: None,
+            disable_ai_in_directories: None,
+            enable_ai_in_directories: None,
             editor: self.editor_settings_content(),
             extension: ExtensionSettingsContent::default(),
             call_hierarchy: None,
             file_finder: None,
+            zhack: None,
             git: self.git_settings_content(),
             git_panel: self.git_panel_settings_content(),
             global_lsp_settings: skip_default(GlobalLspSettingsContent {

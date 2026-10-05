@@ -158,6 +158,8 @@ pub struct SettingsStore {
     last_user_settings_content: Option<String>,
     last_global_settings_content: Option<String>,
     local_settings: BTreeMap<(WorktreeId, Arc<RelPath>), SettingsContent>,
+    /// Absolute and canonical root paths of local worktrees, for `*_ai_in_directories`.
+    worktree_root_paths: HashMap<WorktreeId, Vec<Arc<Path>>>,
     pub editorconfig_store: Entity<EditorconfigStore>,
 
     _settings_files_watcher: Option<Task<()>>,
@@ -319,6 +321,7 @@ impl SettingsStore {
             last_user_settings_content: None,
             last_global_settings_content: None,
             local_settings: BTreeMap::default(),
+            worktree_root_paths: HashMap::default(),
             editorconfig_store: cx.new(|_| EditorconfigStore::default()),
             _settings_files_watcher: None,
             setting_file_updates_tx,
@@ -1181,6 +1184,74 @@ impl SettingsStore {
         Ok(())
     }
 
+    pub fn set_worktree_root_path(&mut self, root_id: WorktreeId, path: Arc<Path>, cx: &mut App) {
+        self.worktree_root_paths.insert(root_id, vec![path]);
+        self.recompute_disable_ai_in_directories(cx);
+    }
+
+    /// Only adds to a registered worktree, so a late canonical path cannot resurrect a removed one.
+    pub fn add_worktree_root_path(&mut self, root_id: WorktreeId, path: Arc<Path>, cx: &mut App) {
+        let Some(paths) = self.worktree_root_paths.get_mut(&root_id) else {
+            return;
+        };
+        if !paths.contains(&path) {
+            paths.push(path);
+            self.recompute_disable_ai_in_directories(cx);
+        }
+    }
+
+    pub fn remove_worktree_root_paths(&mut self, root_id: WorktreeId, cx: &mut App) {
+        if self.worktree_root_paths.remove(&root_id).is_some() {
+            self.recompute_disable_ai_in_directories(cx);
+        }
+    }
+
+    fn recompute_disable_ai_in_directories(&mut self, cx: &mut App) {
+        let settings = &self.merged_settings;
+        if settings
+            .enable_ai_in_directories
+            .iter()
+            .chain(&settings.disable_ai_in_directories)
+            .any(|directories| !directories.is_empty())
+        {
+            self.recompute_values(None, cx);
+        }
+    }
+
+    /// AI is disabled while any worktree is under a directory that disables it,
+    /// or contains one, so every file a project can reach is covered.
+    fn disable_ai_for_worktrees(&self, merged: &SettingsContent) -> bool {
+        let disable_ai = merged.project.disable_ai.is_some_and(|value| value.0);
+        let enabled = merged.enable_ai_in_directories.iter().flatten();
+        let disabled = merged.disable_ai_in_directories.iter().flatten();
+        let directories = enabled
+            .map(|directory| (directory, false))
+            .chain(disabled.map(|directory| (directory, true)))
+            .map(|(directory, disable)| {
+                let directory = match directory.strip_prefix("~/") {
+                    Some(rest) => util::paths::home_dir().join(rest),
+                    None => PathBuf::from(directory),
+                };
+                (directory, disable)
+            })
+            .collect::<Vec<_>>();
+        if directories.is_empty() || self.worktree_root_paths.is_empty() {
+            return disable_ai;
+        }
+        self.worktree_root_paths.values().flatten().any(|root| {
+            // On equal depth, `true` sorts last, so disabling wins.
+            let disabled_at_root = directories
+                .iter()
+                .filter(|(directory, _)| root.starts_with(directory))
+                .max_by_key(|(directory, disable)| (directory.components().count(), *disable))
+                .map_or(disable_ai, |(_, disable)| *disable);
+            disabled_at_root
+                || directories
+                    .iter()
+                    .any(|(directory, disable)| *disable && directory.starts_with(root))
+        })
+    }
+
     /// Add or remove a set of local settings via a JSON string.
     pub fn clear_local_settings(&mut self, root_id: WorktreeId, cx: &mut App) -> Result<()> {
         self.local_settings
@@ -1391,6 +1462,7 @@ impl SettingsStore {
                 }
             }
             merged.merge_from_option(self.server_settings.as_deref());
+            merged.project.disable_ai = Some(self.disable_ai_for_worktrees(&merged).into());
 
             // Merge `disable_ai` from all project/local settings into the global value.
             // Since `SaturatingBool` uses OR logic, if any project has `disable_ai: true`,
@@ -1433,6 +1505,7 @@ impl SettingsStore {
                     .disable_ai
                     .merge_from(&server.project.disable_ai);
             }
+            merged.project.disable_ai = Some(self.disable_ai_for_worktrees(&merged).into());
             for local_settings in self.local_settings.values() {
                 merged
                     .project

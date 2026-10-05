@@ -90,6 +90,15 @@ pub struct SelectToEndOfLine {
     pub(super) stop_at_soft_wraps: bool,
 }
 
+/// Sets indentation for the current file without changing its text or settings files.
+#[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
+#[action(namespace = myhack0)]
+#[serde(deny_unknown_fields)]
+pub struct SetIndentation {
+    pub tab_size: u32,
+    pub hard_tabs: bool,
+}
+
 /// Toggles the display of available code actions at the cursor position.
 #[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
 #[action(namespace = editor)]
@@ -419,6 +428,30 @@ actions!(
         /// Toggles a block quote (`> `) prefix on the selected lines (or the
         /// current line) while in Markdown files.
         ToggleBlockQuote,
+    ]
+);
+
+actions!(
+    myhack0,
+    [
+        /// Calculates each selected expression with input-aware rounding.
+        CalculateSelection,
+        /// Calculates each selected expression without additional rounding.
+        PreciseCalculation,
+        /// Removes duplicate lines within each selection.
+        UniqSelection,
+        /// Sorts selected lines in descending case-sensitive order.
+        SortLinesDescending,
+        /// Inserts file:// followed by the clipboard text at every selection.
+        InsertClipboardFileUri,
+        /// Copies the fenced code block containing the primary cursor.
+        CopyCurrentCodeBlock,
+        /// Opens the current local file directory in Tilix.
+        OpenDirectoryInTilix,
+        /// Inserts the local date and English weekday at each selection.
+        InsertDate,
+        /// Inserts the local date, English weekday, and time at each selection.
+        InsertDateTime,
     ]
 );
 

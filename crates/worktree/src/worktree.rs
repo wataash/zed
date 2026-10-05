@@ -1369,6 +1369,8 @@ impl LocalWorktree {
                 } else {
                     (Box::pin(stream::pending()) as _, Arc::new(NullWatcher) as _)
                 };
+                let watcher =
+                    ExcludingWatcher::wrap(watcher, &abs_path, &settings, fs.clone()).await;
                 let fs_case_sensitive = fs.is_case_sensitive().await;
 
                 let is_single_file = snapshot.snapshot.root_dir().is_none();
@@ -4511,7 +4513,13 @@ impl BackgroundScanner {
                 .fs
                 .watch(root_abs_path.as_path(), FS_WATCH_LATENCY)
                 .await;
-            self.watcher = watcher;
+            self.watcher = ExcludingWatcher::wrap(
+                watcher,
+                root_abs_path.as_path(),
+                &self.settings,
+                self.fs.clone(),
+            )
+            .await;
             fs_events_rx = Box::pin(events.map(|events| events.into_iter().collect()));
 
             let state = self.state.lock().await;
@@ -5624,20 +5632,40 @@ impl BackgroundScanner {
         // `canonicalize` is an async filesystem operation that may suspend, so
         // the lock must not be held across the await point below.
         drop(state);
-        let watched_abs_path: Option<Arc<Path>> = if job.is_external {
+        let mut watched_abs_path: Option<Arc<Path>> = if job.is_external {
             self.fs
                 .canonicalize(job.abs_path.as_ref())
                 .await
                 .ok()
-                .map(|canonical| {
-                    let canonical: Arc<Path> = canonical.into();
-                    self.watcher.add(&canonical).log_err();
-                    canonical
-                })
+                .map(Arc::from)
         } else {
-            self.watcher.add(job.abs_path.as_ref()).log_err();
             Some(job.abs_path.clone())
         };
+
+        if cfg!(target_os = "linux") && self.settings.watch_exclusions.sources().next().is_some() {
+            // Resolve internal symlinks too: an alias must not create an inotify
+            // watch on an excluded target. Keep the original registration path
+            // for allowed internal symlinks so event translation stays unchanged.
+            let canonical = self.fs.canonicalize(job.abs_path.as_ref()).await.log_err();
+            let excluded = canonical.as_ref().is_none_or(|canonical| {
+                !self.fs.requires_poll_watcher(canonical)
+                    && (is_watch_excluded(
+                        &self.settings.watch_exclusions,
+                        root_abs_path.as_ref(),
+                        canonical,
+                    ) || is_watch_excluded(
+                        &self.settings.watch_exclusions,
+                        root_abs_path.as_ref(),
+                        job.abs_path.as_ref(),
+                    ))
+            });
+            if excluded {
+                watched_abs_path = None;
+            }
+        }
+        if let Some(path) = &watched_abs_path {
+            self.watcher.add(path).log_err();
+        }
 
         let mut state = self.state.lock().await;
         if let Some(watched_abs_path) = &watched_abs_path {
@@ -7203,6 +7231,80 @@ async fn discover_git_paths(dot_git_abs_path: &Arc<Path>, fs: &dyn Fs) -> (Arc<P
         }
     };
     (repository_dir_abs_path, common_dir_abs_path)
+}
+
+/// Filters every registration path, including Git metadata and symlink targets.
+/// Linux watches are non-recursive; recursive backends cannot enforce this policy.
+struct ExcludingWatcher {
+    inner: Arc<dyn Watcher>,
+    fs: Arc<dyn Fs>,
+    root: PathBuf,
+    exclusions: util::paths::PathMatcher,
+}
+
+impl ExcludingWatcher {
+    async fn wrap(
+        inner: Arc<dyn Watcher>,
+        root: &Path,
+        settings: &WorktreeSettings,
+        fs: Arc<dyn Fs>,
+    ) -> Arc<dyn Watcher> {
+        if !cfg!(target_os = "linux") || settings.watch_exclusions.sources().next().is_none() {
+            return inner;
+        }
+        let watcher = Self {
+            inner,
+            fs,
+            root: root.to_path_buf(),
+            exclusions: settings.watch_exclusions.clone(),
+        };
+        // Fs::watch registers the root before returning its watcher.
+        if watcher.is_excluded(root) {
+            watcher.inner.remove(root).log_err();
+        }
+        if watcher.fs.read_link(root).await.is_ok()
+            && let Some(target) = watcher.fs.canonicalize(root).await.log_err()
+        {
+            if watcher.is_excluded(&target) {
+                watcher.inner.remove(&target).log_err();
+            }
+            // Fs::watch also follows the target's parent for symlink roots.
+            if let Some(parent) = target.parent()
+                && watcher.is_excluded(parent)
+            {
+                watcher.inner.remove(parent).log_err();
+            }
+        }
+        Arc::new(watcher)
+    }
+
+    fn is_excluded(&self, path: &Path) -> bool {
+        if self.fs.requires_poll_watcher(path) {
+            return false;
+        }
+        is_watch_excluded(&self.exclusions, &self.root, path)
+    }
+}
+
+fn is_watch_excluded(exclusions: &util::paths::PathMatcher, root: &Path, path: &Path) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    relative
+        .ancestors()
+        .any(|ancestor| exclusions.is_match_std_path(ancestor))
+}
+
+impl Watcher for ExcludingWatcher {
+    fn add(&self, path: &Path) -> Result<()> {
+        if self.is_excluded(path) {
+            Ok(())
+        } else {
+            self.inner.add(path)
+        }
+    }
+
+    fn remove(&self, path: &Path) -> Result<()> {
+        self.inner.remove(path)
+    }
 }
 
 struct NullWatcher;
