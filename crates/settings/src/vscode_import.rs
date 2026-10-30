@@ -192,11 +192,14 @@ impl VsCodeSettings {
                 .read_u64("workbench.commandPalette.history")
                 .map(|history| CommandPaletteSettingsContent {
                     use_command_history: Some(history > 0),
+                    ..Default::default()
                 }),
             copilot: None,
             credentials_url: None,
             debugger: None,
             diagnostics: None,
+            disable_ai_in_directories: None,
+            enable_ai_in_directories: None,
             editor: self.editor_settings_content(),
             extension: ExtensionSettingsContent::default(),
             call_hierarchy: None,
@@ -533,6 +536,7 @@ impl VsCodeSettings {
 
     fn project_settings_content(&self) -> ProjectSettingsContent {
         ProjectSettingsContent {
+            zhack: None,
             all_languages: AllLanguageSettingsContent {
                 edit_predictions: self.edit_predictions_settings_content(),
                 defaults: self.default_language_settings_content(),

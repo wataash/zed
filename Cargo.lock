@@ -3473,6 +3473,7 @@ dependencies = [
  "command_palette_hooks",
  "db",
  "editor",
+ "extension",
  "fuzzy_nucleo",
  "go_to_line",
  "gpui",
@@ -3483,6 +3484,7 @@ dependencies = [
  "postage",
  "project",
  "serde",
+ "serde_json",
  "settings",
  "telemetry",
  "theme",
@@ -5537,6 +5539,7 @@ dependencies = [
  "base64 0.22.1",
  "breadcrumbs",
  "buffer_diff",
+ "chrono",
  "client",
  "clock",
  "collections",
@@ -5546,6 +5549,7 @@ dependencies = [
  "db",
  "edit_prediction_types",
  "emojis",
+ "extension",
  "feature_flags",
  "file_icons",
  "fs",
@@ -5611,6 +5615,7 @@ dependencies = [
  "vim_mode_setting",
  "workspace",
  "zed_actions",
+ "zed_editor_command_api",
  "zlog",
  "ztracing",
 ]
@@ -6113,6 +6118,7 @@ dependencies = [
  "wasm-encoder 0.254.2",
  "wasmparser 0.254.2",
  "which",
+ "zed_editor_command_api",
  "ztracing",
 ]
 
@@ -6391,10 +6397,13 @@ dependencies = [
  "futures 0.3.34",
  "fuzzy",
  "fuzzy_nucleo",
+ "globset",
  "gpui",
  "language",
+ "log",
  "menu",
  "open_path_prompt",
+ "paths",
  "picker",
  "picker_preview",
  "pretty_assertions",
@@ -12299,6 +12308,7 @@ dependencies = [
 name = "open_path_prompt"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "editor",
  "file_icons",
  "futures 0.3.34",
@@ -12306,7 +12316,6 @@ dependencies = [
  "gpui",
  "picker",
  "project",
- "serde",
  "serde_json",
  "settings",
  "theme",
@@ -16125,6 +16134,7 @@ dependencies = [
  "lsp",
  "menu",
  "multi_buffer",
+ "open_path_prompt",
  "picker",
  "picker_preview",
  "pretty_assertions",
@@ -22050,6 +22060,7 @@ dependencies = [
  "agent_settings",
  "any_vec",
  "anyhow",
+ "assets",
  "async-recursion",
  "chrono",
  "client",
@@ -22063,6 +22074,7 @@ dependencies = [
  "futures-lite 2.6.1",
  "git",
  "gpui",
+ "gpui_wgpu",
  "http_client",
  "itertools 0.14.0",
  "language",
@@ -22861,6 +22873,15 @@ dependencies = [
  "paths",
  "release_channel",
  "serde_json",
+]
+
+[[package]]
+name = "zed_editor_command_api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.41.0",
 ]
 
 [[package]]

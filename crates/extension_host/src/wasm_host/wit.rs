@@ -118,21 +118,40 @@ impl Extension {
         if version >= latest::MIN_VERSION {
             authorize_access_to_unreleased_wasm_api_version(release_channel)?;
 
-            let extension =
-                latest::Extension::instantiate_async(store, component, latest::linker(executor))
-                    .await
-                    .map_err(anyhow::Error::from)
-                    .context("failed to instantiate wasm extension")?;
+            let instance = latest::linker(executor)
+                .instantiate_async(&mut *store, component)
+                .await?;
+            let name = if instance
+                .get_func(&mut *store, "run-editor-command-v2")
+                .is_some()
+            {
+                "run-editor-command-v2"
+            } else {
+                "run-editor-command"
+            };
+            if instance.get_func(&mut *store, name).is_some() {
+                store.data_mut().editor_command = Some(instance.get_typed_func(&mut *store, name)?);
+                store.data_mut().editor_command_v2 = name.ends_with("-v2");
+            }
+            let extension = latest::Extension::new(&mut *store, &instance)?;
             Ok(Self::V0_8_0(extension))
         } else if version >= since_v0_6_0::MIN_VERSION {
-            let extension = since_v0_6_0::Extension::instantiate_async(
-                store,
-                component,
-                since_v0_6_0::linker(executor),
-            )
-            .await
-            .map_err(anyhow::Error::from)
-            .context("failed to instantiate wasm extension")?;
+            let instance = since_v0_6_0::linker(executor)
+                .instantiate_async(&mut *store, component)
+                .await?;
+            let name = if instance
+                .get_func(&mut *store, "run-editor-command-v2")
+                .is_some()
+            {
+                "run-editor-command-v2"
+            } else {
+                "run-editor-command"
+            };
+            if instance.get_func(&mut *store, name).is_some() {
+                store.data_mut().editor_command = Some(instance.get_typed_func(&mut *store, name)?);
+                store.data_mut().editor_command_v2 = name.ends_with("-v2");
+            }
+            let extension = since_v0_6_0::Extension::new(&mut *store, &instance)?;
             Ok(Self::V0_6_0(extension))
         } else if version >= since_v0_5_0::MIN_VERSION {
             let extension = since_v0_5_0::Extension::instantiate_async(

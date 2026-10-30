@@ -2,6 +2,8 @@ use anyhow::Result;
 use serde_json::Value;
 use settings_content::{PlatformOverrides, ReleaseChannelOverrides};
 
+pub(crate) mod zhack;
+
 /// Applies a migration callback to the root settings object as well as all
 /// nested platform, release-channel, and profile override objects.
 pub(crate) fn migrate_settings(

@@ -85,6 +85,26 @@ impl extension::Extension for WasmExtension {
         self.work_dir.clone()
     }
 
+    async fn run_editor_command(&self, command: String, input: String) -> Result<String> {
+        self.call(move |_, store| {
+            async move {
+                let function = store
+                    .data()
+                    .editor_command
+                    .context("This extension has no editor command export")?;
+                // Preserve compatibility with extensions built against the original strict schema.
+                let input = if store.data().editor_command_v2 { input } else {
+                    let input: serde_json::Value = serde_json::from_str(&input)?;
+                    serde_json::to_string(&serde_json::json!({"selections": input.get("selections").context("Missing selections")?, "local_time": input.get("local_time").context("Missing local time")?}))?
+                };
+                let (result,) = function.call_async(&mut *store, (command, input)).await?;
+                result.map_err(anyhow::Error::msg)
+            }
+            .boxed()
+        })
+        .await?
+    }
+
     async fn language_server_command(
         &self,
         language_server_id: LanguageServerName,
@@ -539,7 +559,12 @@ impl extension::Extension for WasmExtension {
     }
 }
 
+type EditorCommandFunction =
+    wasmtime::component::TypedFunc<(String, String), (Result<String, String>,)>;
+
 pub struct WasmState {
+    editor_command: Option<EditorCommandFunction>,
+    editor_command_v2: bool,
     manifest: Arc<ExtensionManifest>,
     pub table: ResourceTable,
     ctx: WasiCtx,
@@ -680,6 +705,8 @@ impl WasmHost {
                         manifest.clone(),
                     ),
                     language_server_status_source: None,
+                    editor_command: None,
+                    editor_command_v2: false,
                 },
             );
             // Store will yield after 1 tick, and get a new deadline of 1 tick after each yield.
@@ -1052,6 +1079,83 @@ mod tests {
             extension::init(cx);
             gpui_tokio::init(cx);
         });
+    }
+
+    /// Run explicitly with ZED_EDITOR_COMMAND_TEST_WASM pointing to a built provider.
+    #[gpui::test]
+    #[ignore = "requires a built editing-command extension"]
+    async fn test_optional_editor_command_wasm(cx: &mut TestAppContext) {
+        use extension::Extension as _;
+        init_test(cx);
+        cx.executor().allow_parking();
+        let path = std::env::var("ZED_EDITOR_COMMAND_TEST_WASM").expect("WASM provider path");
+        let bytes = std::fs::read(path).expect("built provider");
+        let work = tempfile::tempdir().expect("work directory");
+        let host = cx.update(|cx| {
+            WasmHost::new(
+                fs::RealFs::new(None, cx.background_executor().clone()),
+                FakeHttpClient::with_200_response(),
+                NodeRuntime::unavailable(),
+                Arc::new(ExtensionHostProxy::default()),
+                work.path().to_owned(),
+                cx,
+            )
+        });
+        let manifest: ExtensionManifest = toml::from_str(
+            r#"
+            id = "command-fixture"
+            name = "Command fixture"
+            version = "0.1.0"
+            schema_version = 1
+        "#,
+        )
+        .expect("manifest");
+        let extension = host
+            .load_extension(bytes, &Arc::new(manifest), &cx.to_async())
+            .await
+            .expect("load optional exports alongside official ABI");
+        let input =
+            json!({"selections": ["1+2", "2*3"], "local_time": "2026-10-23T23:04:05+09:00"})
+                .to_string();
+        for _ in 0..2 {
+            let result = extension
+                .run_editor_command("calculate".into(), input.clone())
+                .await
+                .expect("WASM calculation");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&result).expect("JSON"),
+                json!({"replacements": ["3.00", "6.00"]})
+            );
+        }
+        assert!(
+            extension
+                .run_editor_command("missing".into(), input)
+                .await
+                .is_err()
+        );
+        let input =
+            json!({"selections": [""], "local_time": "2026-10-23T23:04:05+09:00"}).to_string();
+        let result = extension
+            .run_editor_command("insert-date-time".into(), input)
+            .await
+            .expect("WASM local time");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result).expect("JSON"),
+            json!({"replacements": ["2026-10-23 Fri 23:04:05"]})
+        );
+        let input = json!({"selections": [""], "local_time": "2026-10-23T23:04:05+09:00", "context": {"path":"/notes/source.md"}, "arguments": {"suffix":".private"}}).to_string();
+        let result = extension
+            .run_editor_command("create-companion".into(), input)
+            .await
+            .expect("v2 context and effects");
+        let result: serde_json::Value = serde_json::from_str(&result).expect("JSON effects");
+        assert_eq!(
+            result.get("effects"),
+            Some(&json!([
+                {"kind":"create_file", "path":"/notes/source.private.md"},
+                {"kind":"open_file", "path":"/notes/source.private.md"}
+            ]))
+        );
     }
 
     #[gpui::test]

@@ -481,6 +481,34 @@ async fn test_copy_recursive_with_ignoring(executor: BackgroundExecutor) {
 }
 
 #[gpui::test]
+async fn test_realfs_exclusive_create_finishes_writing(executor: BackgroundExecutor) {
+    let fs = RealFs::new(None, executor);
+    let temp_dir = TempDir::new().expect("temporary directory");
+    gpui::block_on(async {
+        for size in [1, 1024, 256 * 1024] {
+            let path = temp_dir.path().join(format!("image-{size}.png"));
+            let bytes = vec![0x8f; size];
+            fs.create_file_exclusive(&path, &bytes)
+                .await
+                .expect("create image");
+            // Undo reads the identity immediately after creation, so pending
+            // background writes must not change the file after this returns.
+            assert!(std::fs::read(&path).expect("read image") == bytes);
+            assert_eq!(
+                std::fs::metadata(&path).expect("image metadata").len(),
+                size as u64
+            );
+            assert!(
+                fs.create_file_exclusive(&path, b"replacement")
+                    .await
+                    .is_err()
+            );
+            assert!(std::fs::read(&path).expect("read original image") == bytes);
+        }
+    });
+}
+
+#[gpui::test]
 async fn test_realfs_atomic_write(executor: BackgroundExecutor) {
     // With the file handle still open, the file should be replaced
     // https://github.com/zed-industries/zed/issues/30054

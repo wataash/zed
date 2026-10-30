@@ -2,13 +2,17 @@ use std::{future::IntoFuture, path::Path, time::Duration};
 
 use super::*;
 use editor::{Editor, SelectionEffects};
-use gpui::{Entity, TestAppContext, VisualTestContext};
+use gpui::{Entity, TestAppContext, UpdateGlobal, VisualTestContext};
 use menu::{Cancel, Confirm, SelectNext, SelectPrevious};
 use pretty_assertions::{assert_eq, assert_matches};
 use project::{FS_WATCH_LATENCY, RemoveOptions};
 use serde_json::json;
 use settings::{SettingsStore, SplicingVec};
-use util::{path, rel_path::rel_path};
+use util::{
+    path,
+    paths::{PathMatcher, PathStyle},
+    rel_path::rel_path,
+};
 use workspace::{
     AppState, CloseActiveItem, Item, MultiWorkspace, OpenOptions, ToggleFileFinder, Workspace,
     open_paths,
@@ -396,6 +400,348 @@ async fn test_absolute_paths(cx: &mut TestAppContext) {
             "Mismatching abs path should produce no matches"
         )
     });
+}
+
+#[gpui::test]
+async fn test_home_relative_path(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    let root = util::paths::home_dir().join("project");
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(&root, json!({ "a": { "file.txt": "" } }))
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [root.as_path()], cx).await;
+    let (picker, _workspace, cx) = build_find_picker(project, cx);
+
+    picker
+        .update_in(cx, |picker, window, cx| {
+            picker
+                .delegate
+                .update_matches("~/project/a/file.txt".to_string(), window, cx)
+        })
+        .await;
+    picker.update(cx, |picker, _| {
+        assert_eq!(
+            collect_search_matches(picker).search_paths_only(),
+            vec![rel_path("a/file.txt").into()],
+        )
+    });
+}
+
+#[gpui::test]
+async fn test_absolute_path_outside_project(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "private_notes": {},
+                "wip": { "wip.md": "external notes" }
+            }),
+        )
+        .await;
+
+    let project = Project::test(
+        app_state.fs.clone(),
+        [path!("/root/private_notes").as_ref()],
+        cx,
+    )
+    .await;
+    let (picker, workspace, cx) = build_find_picker(project.clone(), cx);
+
+    simulate_input(cx, path!("/root/wip/wip.md"));
+    advance_worktree_update_refresh(cx);
+    picker.update(cx, |picker, cx| {
+        assert_eq!(picker.delegate.matches.len(), 1);
+        assert_eq!(
+            picker
+                .delegate
+                .matches
+                .get(0)
+                .and_then(|entry| entry.abs_path(&project, cx)),
+            Some(PathBuf::from(path!("/root/wip/wip.md")))
+        );
+        assert_eq!(project.read(cx).visible_worktrees(cx).count(), 1);
+        let path_match = picker
+            .delegate
+            .matches
+            .get(0)
+            .and_then(Match::panel_match)
+            .expect("external file should have a search match");
+        assert_eq!(
+            picker
+                .delegate
+                .labels_for_path_match(&path_match.0, project.read(cx).path_style(cx))
+                .0,
+            "wip.md"
+        );
+    });
+    cx.dispatch_action(Confirm);
+    cx.read(|cx| {
+        let active_editor = workspace
+            .read(cx)
+            .active_item_as::<Editor>(cx)
+            .expect("external file should open");
+        assert_eq!(active_editor.read(cx).title(cx), "wip.md");
+        assert_eq!(active_editor.read(cx).text(cx), "external notes");
+    });
+}
+
+#[gpui::test]
+async fn test_absolute_path_outside_project_survives_worktree_refresh(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "project": { "main.rs": "" },
+                "notes": { "wip": { "AUTOCOMMIT.md": "notes" } }
+            }),
+        )
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/root/project").as_ref()], cx).await;
+    let (picker, _workspace, cx) = build_find_picker(project.clone(), cx);
+
+    simulate_input(cx, path!("/root/notes/wip/AUTOCOMMIT.md"));
+    advance_worktree_update_refresh(cx);
+    picker.update(cx, |picker, cx| {
+        assert_eq!(
+            picker
+                .delegate
+                .matches
+                .get(0)
+                .and_then(|entry| entry.abs_path(&project, cx)),
+            Some(PathBuf::from(path!("/root/notes/wip/AUTOCOMMIT.md")))
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_exact_relative_path_in_ignored_directory(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {},
+                ".gitignore": "/*/\n",
+                "wip": { "AUTOCOMMIT.md": "ignored notes" }
+            }),
+        )
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, workspace, cx) = build_find_picker(project.clone(), cx);
+
+    // The ignored directory is not scanned, so fuzzy matching cannot find the file.
+    simulate_input(cx, "AUTOCOMMIT.md");
+    advance_worktree_update_refresh(cx);
+    picker.update(cx, |picker, _| {
+        assert_eq!(
+            collect_search_matches(picker).search_paths_only(),
+            Vec::<Arc<RelPath>>::new()
+        );
+    });
+
+    picker.update_in(cx, |picker, window, cx| {
+        picker.set_query("wip/AUTOCOMMIT.md", window, cx);
+    });
+    cx.executor().advance_clock(SEARCH_DEBOUNCE);
+    advance_worktree_update_refresh(cx);
+    picker.update(cx, |picker, cx| {
+        assert_eq!(picker.delegate.matches.len(), 1);
+        assert_eq!(
+            picker
+                .delegate
+                .matches
+                .get(0)
+                .and_then(|entry| entry.abs_path(&project, cx)),
+            Some(PathBuf::from(path!("/root/wip/AUTOCOMMIT.md")))
+        );
+    });
+    cx.dispatch_action(Confirm);
+    cx.read(|cx| {
+        let active_editor = workspace
+            .read(cx)
+            .active_item_as::<Editor>(cx)
+            .expect("ignored file should open");
+        assert_eq!(active_editor.read(cx).title(cx), "AUTOCOMMIT.md");
+        assert_eq!(active_editor.read(cx).text(cx), "ignored notes");
+    });
+}
+
+fn set_file_finder_settings(
+    cx: &mut TestAppContext,
+    include_ignored: Option<bool>,
+    walk_unloaded_ignored: bool,
+    exclusions: &[&str],
+) {
+    cx.update(|cx| {
+        let settings = FileFinderSettings::get_global(cx).clone();
+        FileFinderSettings::override_global(
+            FileFinderSettings {
+                include_ignored,
+                walk_unloaded_ignored,
+                exclusions: PathMatcher::new(exclusions, PathStyle::local()).unwrap(),
+                ..settings
+            },
+            cx,
+        );
+    });
+}
+
+async fn insert_tree_with_ignored_directories(app_state: &Arc<AppState>) {
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {},
+                ".gitignore": "/tech/\n/node_modules/\n",
+                "notes.md": "",
+                "tech": {
+                    "unison": { "unison-tech.prf": "profile" },
+                    ".git": { "unison-config": "" },
+                },
+                "node_modules": { "unison": { "index.js": "" } },
+            }),
+        )
+        .await;
+}
+
+#[gpui::test]
+async fn test_all_files_walks_unloaded_ignored_directories(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    set_file_finder_settings(cx, Some(true), true, &["**/node_modules"]);
+    insert_tree_with_ignored_directories(&app_state).await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, workspace, cx) = build_find_picker(project, cx);
+
+    simulate_input(cx, "unison");
+    advance_worktree_update_refresh(cx);
+    picker.update(cx, |picker, _| {
+        assert_eq!(
+            collect_search_matches(picker).search_paths_only(),
+            vec![rel_path("root/tech/unison/unison-tech.prf").into()],
+            "excluded and scan-excluded directories should not be walked"
+        );
+    });
+
+    cx.dispatch_action(Confirm);
+    cx.read(|cx| {
+        let active_editor = workspace
+            .read(cx)
+            .active_item_as::<Editor>(cx)
+            .expect("walked file should open");
+        assert_eq!(active_editor.read(cx).text(cx), "profile");
+    });
+}
+
+#[gpui::test]
+async fn test_all_does_not_walk_unloaded_ignored_directories(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    set_file_finder_settings(cx, Some(true), false, &[]);
+    insert_tree_with_ignored_directories(&app_state).await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, _, cx) = build_find_picker(project, cx);
+
+    simulate_input(cx, "unison");
+    advance_worktree_update_refresh(cx);
+    picker.update(cx, |picker, _| {
+        assert_eq!(
+            collect_search_matches(picker).search_paths_only(),
+            Vec::<Arc<RelPath>>::new()
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_exclusions_hide_loaded_files(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    set_file_finder_settings(cx, None, false, &["**/generated"]);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "generated": { "main.rs": "" },
+                "src": { "main.rs": "" },
+            }),
+        )
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, _, cx) = build_find_picker(project, cx);
+
+    simulate_input(cx, "main");
+    picker.update(cx, |picker, _| {
+        assert_eq!(
+            collect_search_matches(picker).search_paths_only(),
+            vec![rel_path("root/src/main.rs").into()]
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_exclude_selected(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "a": { "main.rs": "" },
+                "b": { "main.rs": "" },
+            }),
+        )
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, _, cx) = build_find_picker(project, cx);
+
+    simulate_input(cx, "main");
+    picker.update(cx, |picker, _| {
+        assert_eq!(
+            collect_search_matches(picker).search_paths_only(),
+            vec![
+                rel_path("root/a/main.rs").into(),
+                rel_path("root/b/main.rs").into()
+            ]
+        );
+    });
+
+    cx.dispatch_action(ExcludeSelected);
+    cx.run_until_parked();
+    picker.update(cx, |picker, _| {
+        assert_eq!(
+            collect_search_matches(picker).search_paths_only(),
+            vec![rel_path("root/b/main.rs").into()]
+        );
+        assert_eq!(picker.delegate.selected_index, 0);
+    });
+    let settings_text = app_state
+        .fs
+        .load(paths::settings_file())
+        .await
+        .expect("settings file should be written");
+    assert!(
+        settings_text.contains(r#""**/a/main.rs""#),
+        "unexpected settings: {settings_text}"
+    );
 }
 
 #[gpui::test]
@@ -1203,7 +1549,7 @@ async fn test_toggle_action_include_ignored_param(cx: &mut TestAppContext) {
     ];
     for (setting, action_param, expected) in cases {
         cx.update(|_, cx| {
-            let settings = *FileFinderSettings::get_global(cx);
+            let settings = FileFinderSettings::get_global(cx).clone();
             FileFinderSettings::override_global(
                 FileFinderSettings {
                     include_ignored: setting,
@@ -3138,7 +3484,7 @@ async fn test_setting_auto_select_first_and_select_active_file(cx: &mut TestAppC
     let app_state = init_test(cx);
 
     cx.update(|cx| {
-        let settings = *FileFinderSettings::get_global(cx);
+        let settings = FileFinderSettings::get_global(cx).clone();
 
         FileFinderSettings::override_global(
             FileFinderSettings {
@@ -4893,7 +5239,7 @@ async fn test_no_seed_query_when_setting_disabled(cx: &mut TestAppContext) {
     let app_state = init_test(cx);
 
     cx.update(|cx| {
-        let settings = *FileFinderSettings::get_global(cx);
+        let settings = FileFinderSettings::get_global(cx).clone();
         FileFinderSettings::override_global(
             FileFinderSettings {
                 prefill_query_from_selection: false,
@@ -5481,5 +5827,156 @@ async fn test_hover_does_not_set_has_changed_selected_index(cx: &mut TestAppCont
             picker.delegate.has_changed_selected_index,
             "keyboard should set `has_changed_selected_index`"
         );
+    });
+}
+
+#[gpui::test]
+async fn test_additional_search_roots_toggle(cx: &mut TestAppContext) {
+    #[cfg(feature = "visual-test-capture")]
+    workspace::visual_test_capture::initialize(cx).expect("capture renderer");
+
+    let app_state = init_test(cx);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree("/notes", json!({"memo-current.txt": "current"}))
+        .await;
+    fs.insert_tree(
+        "/archive",
+        json!({"memo-old.txt": "old", "target": {"memo-hidden.txt": "hidden"}}),
+    )
+    .await;
+    fs.insert_tree("/other", json!({"memo-other.txt": "other"}))
+        .await;
+    let project = Project::test(app_state.fs.clone(), [Path::new("/notes")], cx).await;
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                let search = settings
+                    .project
+                    .zhack
+                    .get_or_insert_default()
+                    .search
+                    .get_or_insert_default();
+                search.exclusions = Some(SplicingVec::from(vec!["**/target".into()]));
+            });
+        })
+    });
+    let root_id = project.read_with(cx, |project, cx| {
+        project
+            .visible_worktrees(cx)
+            .next()
+            .expect("notes root")
+            .read(cx)
+            .id()
+    });
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_local_settings(
+                    root_id,
+                    settings::LocalSettingsPath::InWorktree(RelPath::empty_arc()),
+                    settings::LocalSettingsKind::Settings,
+                    Some(
+                        r#"{"zhack":{"search":{"additional_roots":["../archive/", "../other/"]}}}"#,
+                    ),
+                    cx,
+                )
+                .expect("local root settings");
+        })
+    });
+    let (picker, workspace, cx) = build_find_picker(project.clone(), cx);
+    cx.update(|_, cx| {
+        cx.bind_keys([gpui::KeyBinding::new(
+            "ctrl-p",
+            ToggleFileFinder::default(),
+            None,
+        )])
+    });
+    simulate_input(cx, "memo");
+    picker.read_with(cx, |picker, cx| {
+        assert!(
+            picker.delegate.search_scope.is_configured(),
+            "local additional roots must reach the finder"
+        );
+        assert!(!picker.delegate.search_scope.expanded);
+        assert_eq!(picker.query(cx), "memo");
+        assert_eq!(picker.delegate.matches.len(), 2); // CreateNew plus current memo.
+        assert!(
+            picker
+                .delegate
+                .matches
+                .matches
+                .iter()
+                .filter_map(Match::relative_path)
+                .all(|path| !path.as_unix_str().contains("old"))
+        );
+    });
+    #[cfg(feature = "visual-test-capture")]
+    workspace::visual_test_capture::capture(cx, "file-finder-normal")
+        .expect("normal scope capture");
+    cx.simulate_keystrokes("ctrl-p");
+    cx.executor().advance_clock(SEARCH_DEBOUNCE);
+    cx.run_until_parked();
+    picker.read_with(cx, |picker, cx| {
+        assert!(picker.delegate.search_scope.expanded);
+        assert_eq!(picker.query(cx), "memo");
+        let paths = picker
+            .delegate
+            .matches
+            .matches
+            .iter()
+            .filter_map(Match::relative_path)
+            .map(|path| path.as_unix_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"memo-old.txt"), "{paths:?}");
+        assert!(paths.contains(&"memo-other.txt"), "{paths:?}");
+        assert!(!paths.iter().any(|path| path.contains("hidden")));
+    });
+    #[cfg(feature = "visual-test-capture")]
+    workspace::visual_test_capture::capture(cx, "file-finder-expanded")
+        .expect("expanded scope capture");
+    let archive_id = project.read_with(cx, |project, cx| {
+        project
+            .visible_worktrees(cx)
+            .find(|worktree| worktree.read(cx).abs_path().as_ref() == Path::new("/archive"))
+            .expect("attached archive")
+            .read(cx)
+            .id()
+    });
+    picker.update(cx, |picker, _| {
+        picker.delegate.history_items.push(FoundPath::new(
+            ProjectPath {
+                worktree_id: archive_id,
+                path: rel_path("memo-old.txt").into(),
+            },
+            "/archive/memo-old.txt".into(),
+        ));
+    });
+    // Returning to normal scope cancels pending results and hides archive history too.
+    cx.simulate_keystrokes("ctrl-p");
+    cx.executor().advance_clock(SEARCH_DEBOUNCE);
+    cx.run_until_parked();
+    picker.read_with(cx, |picker, _| {
+        assert!(!picker.delegate.search_scope.expanded);
+        assert!(
+            picker
+                .delegate
+                .matches
+                .matches
+                .iter()
+                .filter_map(Match::relative_path)
+                .all(|path| !path.as_unix_str().contains("old")
+                    && !path.as_unix_str().contains("other"))
+        );
+    });
+    #[cfg(feature = "visual-test-capture")]
+    workspace::visual_test_capture::capture(cx, "file-finder-narrowed")
+        .expect("narrowed scope capture");
+    cx.dispatch_action(Cancel);
+    let reopened = open_file_picker(&workspace, cx);
+    reopened.read_with(cx, |picker, _| {
+        assert!(!picker.delegate.search_scope.expanded)
+    });
+    project.read_with(cx, |project, cx| {
+        assert_eq!(project.visible_worktrees(cx).count(), 3)
     });
 }

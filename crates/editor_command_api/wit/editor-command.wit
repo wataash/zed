@@ -1,0 +1,6 @@
+package wataash:editor-command@0.1.0;
+
+world editor-command {
+    export run-editor-command-v2: func(command: string, input: string) -> result<string, string>;
+    export run-editor-command: func(command: string, input: string) -> result<string, string>;
+}

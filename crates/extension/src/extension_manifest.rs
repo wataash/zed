@@ -114,6 +114,8 @@ pub struct ExtensionManifest {
     pub context_servers: BTreeMap<Arc<str>, ContextServerManifestEntry>,
     #[serde(default)]
     pub slash_commands: BTreeMap<Arc<str>, SlashCommandManifestEntry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub editor_commands: BTreeMap<Arc<str>, zed_editor_command_api::CommandDefinition>,
     #[serde(default)]
     pub snippets: Option<ExtensionSnippets>,
     #[serde(default)]
@@ -517,6 +519,7 @@ fn manifest_from_old_manifest(
         language_servers: Default::default(),
         context_servers: BTreeMap::default(),
         slash_commands: BTreeMap::default(),
+        editor_commands: Default::default(),
         snippets: None,
         capabilities: Vec::new(),
         debug_adapters: Default::default(),
@@ -551,6 +554,7 @@ mod tests {
             language_servers: BTreeMap::default(),
             context_servers: BTreeMap::default(),
             slash_commands: BTreeMap::default(),
+            editor_commands: Default::default(),
             snippets: None,
             capabilities: vec![],
             debug_adapters: Default::default(),
@@ -789,4 +793,26 @@ mod next_schema_version_tests {
         assert!(entry.is_opt_in_for(&julia));
         assert!(!entry.is_opt_in_for(&markdown));
     }
+}
+
+#[test]
+fn test_editor_command_manifest_round_trip() {
+    let manifest: ExtensionManifest = toml::from_str(
+        r#"
+        id = "fixture"
+        name = "Fixture"
+        version = "0.1.0"
+        schema_version = 1
+        [editor_commands.copy]
+        title = "fixture: copy"
+        context = { clipboard = true }
+        [editor_commands.companion]
+        title = "fixture: companion"
+        arguments = { suffix = ".x" }
+    "#,
+    )
+    .expect("command manifest");
+    let encoded = toml::to_string(&manifest).expect("manifest export supports omitted arguments");
+    let decoded: ExtensionManifest = toml::from_str(&encoded).expect("manifest reload");
+    assert_eq!(decoded, manifest);
 }

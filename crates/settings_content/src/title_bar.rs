@@ -81,6 +81,11 @@ impl From<String> for WindowButtonLayoutContent {
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
 pub struct TitleBarSettingsContent {
+    /// Tint the title bar using a stable hash of the first project root's absolute path
+    /// and, for remote projects, the connection type and host.
+    ///
+    /// Default: true
+    pub workspace_color: Option<bool>,
     /// Whether to show git status indicators on the branch icon in the title bar.
     /// When enabled, the branch icon changes to reflect the current repository
     /// status (e.g. modified, added, deleted, or conflict).

@@ -233,6 +233,26 @@ pub struct SettingsContent {
     /// Configuration for Diagnostics-related features.
     pub diagnostics: Option<DiagnosticsSettingsContent>,
 
+    /// Enables AI for worktrees under the given directories, overriding `disable_ai`.
+    /// The deepest directory listed here or in `disable_ai_in_directories` wins.
+    /// Project settings cannot set this.
+    ///
+    /// Example: {"disable_ai": true, "enable_ai_in_directories": ["~/src/oss"]}
+    ///
+    /// Default: []
+    pub enable_ai_in_directories: Option<Vec<String>>,
+
+    /// Disables AI for worktrees under the given directories, overriding `disable_ai`.
+    /// The deepest directory listed here or in `enable_ai_in_directories` wins,
+    /// and this list wins for a directory listed in both.
+    /// While any open worktree resolves to disabled, AI is disabled everywhere,
+    /// as with `disable_ai` in project settings. Project settings cannot set this.
+    ///
+    /// Example: {"disable_ai_in_directories": ["~/secrets"]}
+    ///
+    /// Default: []
+    pub disable_ai_in_directories: Option<Vec<String>>,
+
     /// Configuration for Git-related features
     pub git: Option<GitSettings>,
 
@@ -407,6 +427,8 @@ fallible_options::flattened_deserialize!(SettingsContent {
     options: {
         call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, tab_switcher, status_bar, preview_tabs, agent,
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
+        disable_ai_in_directories,
+        enable_ai_in_directories,
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, copilot, outline_panel, project_panel,
@@ -961,10 +983,64 @@ pub struct PanelSettingsContent {
 #[with_fallible_options]
 #[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
 pub struct CommandPaletteSettingsContent {
+    /// Additional palette entries, mapping display titles to [action name, arguments].
+    pub commands: Option<collections::HashMap<String, serde_json::Value>>,
     /// Whether to use command history ranking for sorting in the command palette.
     ///
     /// Default: true
     pub use_command_history: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct ZhackSettingsContent {
+    /// Extension commands invoked for saved local files when opened or renamed.
+    pub on_file_open: Option<Vec<ZhackEditorHook>>,
+    pub markdown: Option<ZhackMarkdownSettingsContent>,
+    /// Directory globs excluded from native Linux watches, relative to the worktree
+    /// root (or absolute for external paths). Minimal Git metadata directories
+    /// remain watched to detect HEAD, index, and current branch updates.
+    /// Does not exclude files from scanning or display. Default: []
+    pub watch_exclusions: Option<SplicingVec>,
+    pub search: Option<ZhackSearchSettingsContent>,
+}
+
+#[derive(Clone, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct ZhackEditorHook {
+    pub extension: String,
+    pub command: String,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+    #[serde(default)]
+    pub context: serde_json::Value,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct ZhackMarkdownSettingsContent {
+    pub image_paste: Option<ZhackImagePasteSettingsContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct ZhackImagePasteSettingsContent {
+    /// Filename template passed to the image-paste extension. Missing uses its default.
+    pub filename_template: Option<String>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct ZhackSearchSettingsContent {
+    /// Additional local directories excluded from normal search. Repeating the
+    /// search shortcut includes them. Absolute, ~/ or worktree-relative paths.
+    /// Default: []
+    pub additional_roots: Option<Vec<String>>,
+    /// Include ignored files in the file finder, walking directories not yet indexed.
+    /// Default: false
+    pub all_files: Option<bool>,
+    /// Globs excluded from file finder results, history, and project search.
+    /// Paths are relative to each worktree root. Default: []
+    pub exclusions: Option<SplicingVec>,
 }
 
 #[with_fallible_options]

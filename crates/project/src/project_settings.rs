@@ -5,7 +5,9 @@ use dap::adapters::DebugAdapterName;
 use fs::Fs;
 use futures::StreamExt as _;
 use git::repository::DEFAULT_WORKTREE_DIRECTORY;
-use gpui::{AsyncApp, BorrowAppContext, Context, Entity, EventEmitter, Subscription, Task};
+use gpui::{
+    AsyncApp, BorrowAppContext, Context, Entity, EventEmitter, Subscription, Task, TaskExt as _,
+};
 use lsp::{DEFAULT_LSP_REQUEST_TIMEOUT_SECS, LanguageServerName};
 use paths::{
     EDITORCONFIG_NAME, debug_task_file_name, local_debug_file_relative_path,
@@ -39,6 +41,9 @@ use crate::{
 
 #[derive(Debug, Clone, RegisterSetting)]
 pub struct ProjectSettings {
+    pub on_file_open: Vec<settings::ZhackEditorHook>,
+    pub markdown_image_filename_template: Option<String>,
+    pub additional_search_roots: Vec<String>,
     /// Configuration for language servers.
     ///
     /// The following settings can be overridden for specific language servers:
@@ -721,6 +726,26 @@ impl Settings for ProjectSettings {
                 .unwrap_or_else(|| DEFAULT_WORKTREE_DIRECTORY.to_string()),
         };
         Self {
+            on_file_open: content
+                .project
+                .zhack
+                .as_ref()
+                .and_then(|settings| settings.on_file_open.clone())
+                .unwrap_or_default(),
+            additional_search_roots: content
+                .project
+                .zhack
+                .as_ref()
+                .and_then(|settings| settings.search.as_ref())
+                .and_then(|search| search.additional_roots.clone())
+                .unwrap_or_default(),
+            markdown_image_filename_template: content
+                .project
+                .zhack
+                .as_ref()
+                .and_then(|settings| settings.markdown.as_ref())
+                .and_then(|markdown| markdown.image_paste.as_ref())
+                .and_then(|image| image.filename_template.clone()),
             context_servers: project
                 .context_servers
                 .clone()
@@ -1142,20 +1167,51 @@ impl SettingsObserver {
         cx: &mut Context<Self>,
     ) {
         match event {
-            WorktreeStoreEvent::WorktreeAdded(worktree) => cx
-                .subscribe(worktree, |this, worktree, event, cx| {
+            WorktreeStoreEvent::WorktreeAdded(worktree) => {
+                self.register_worktree_root(worktree, cx);
+                cx.subscribe(worktree, |this, worktree, event, cx| {
                     if let worktree::Event::UpdatedEntries(changes) = event {
                         this.update_local_worktree_settings(&worktree, changes, cx)
                     }
                 })
-                .detach(),
+                .detach()
+            }
             WorktreeStoreEvent::WorktreeRemoved(_, worktree_id) => {
                 cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store.remove_worktree_root_paths(*worktree_id, cx);
                     store.clear_local_settings(*worktree_id, cx).log_err();
                 });
             }
             _ => {}
         }
+    }
+
+    /// Registers the root for `*_ai_in_directories` before any buffer can open.
+    /// The canonical path follows, so a symlink into such a directory is covered too.
+    fn register_worktree_root(&self, worktree: &Entity<Worktree>, cx: &mut Context<Self>) {
+        let SettingsObserverMode::Local(fs) = &self.mode else {
+            return;
+        };
+        let worktree = worktree.read(cx);
+        if !worktree.is_local() {
+            return;
+        }
+        let worktree_id = worktree.id();
+        let abs_path = worktree.abs_path();
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.set_worktree_root_path(worktree_id, abs_path.clone(), cx);
+        });
+        let fs = fs.clone();
+        cx.spawn(async move |_, cx| {
+            let canonical_path = fs.canonicalize(&abs_path).await?;
+            if canonical_path.as_path() != abs_path.as_ref() {
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store.add_worktree_root_path(worktree_id, canonical_path.into(), cx);
+                });
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn update_local_worktree_settings(

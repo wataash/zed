@@ -90,6 +90,15 @@ pub struct SelectToEndOfLine {
     pub(super) stop_at_soft_wraps: bool,
 }
 
+/// Sets indentation for the current file without changing its text or settings files.
+#[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
+#[action(namespace = myhack0)]
+#[serde(deny_unknown_fields)]
+pub struct SetIndentation {
+    pub tab_size: u32,
+    pub hard_tabs: bool,
+}
+
 /// Toggles the display of available code actions at the cursor position.
 #[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
 #[action(namespace = editor)]
@@ -419,6 +428,41 @@ actions!(
         /// Toggles a block quote (`> `) prefix on the selected lines (or the
         /// current line) while in Markdown files.
         ToggleBlockQuote,
+    ]
+);
+
+/// Sorts one selected line range using the VS Code-compatible myext0 language server.
+#[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
+#[action(namespace = myhack0)]
+#[serde(deny_unknown_fields)]
+pub struct SortLinesLikeVsCode {
+    #[serde(default)]
+    pub descending: bool,
+}
+
+actions!(
+    myhack0,
+    [
+        /// Creates or opens an empty .x companion beside the current local file.
+        CreateXFile,
+        /// Calculates each selected expression with input-aware rounding.
+        CalculateSelection,
+        /// Calculates each selected expression without additional rounding.
+        PreciseCalculation,
+        /// Removes duplicate lines within each selection.
+        UniqSelection,
+        /// Sorts selected lines in descending case-sensitive order.
+        SortLinesDescending,
+        /// Inserts file:// followed by the clipboard text at every selection.
+        InsertClipboardFileUri,
+        /// Copies the fenced code block containing the primary cursor.
+        CopyCurrentCodeBlock,
+        /// Opens the current local file directory in Tilix.
+        OpenDirectoryInTilix,
+        /// Inserts the local date and English weekday at each selection.
+        InsertDate,
+        /// Inserts the local date, English weekday, and time at each selection.
+        InsertDateTime,
     ]
 );
 
@@ -1071,4 +1115,28 @@ pub struct ConfirmEditReviewComment {
 #[serde(deny_unknown_fields)]
 pub struct CancelEditReviewComment {
     pub id: usize,
+}
+
+/// Runs an editing command exported by a loaded extension.
+#[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct ExecuteExtensionCommand {
+    pub extension: String,
+    pub command: String,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+    #[serde(default)]
+    pub context: serde_json::Value,
+}
+
+/// Runs one enabled LSP code action with the exact requested kind.
+#[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct ExecuteCodeAction {
+    pub kind: String,
+    /// Select complete result lines, useful for line transformations such as sorting.
+    #[serde(default)]
+    pub select_lines: bool,
 }

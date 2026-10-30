@@ -168,6 +168,9 @@ impl Search {
     /// Prepares a project search run. The resulting [`SearchResultsHandle`] has to be used to specify whether you're interested in matching buffers
     /// or full search results.
     pub fn into_handle(mut self, query: SearchQuery, cx: &mut App) -> SearchResultsHandle {
+        if let SearchKind::Local { worktrees, .. } = &mut self.kind {
+            worktrees.retain(|worktree| query.includes_worktree(worktree.read(cx).id()));
+        }
         let mut open_buffers = HashMap::default();
         let mut unnamed_buffers = Vec::new();
         let mut entryless_file_buffers = Vec::new();
@@ -176,6 +179,12 @@ impl Search {
         let buffers = self.buffer_store.read(cx);
         for handle in buffers.buffers() {
             let buffer = handle.read(cx);
+            if buffer
+                .file()
+                .is_some_and(|file| !query.includes_worktree(file.worktree_id(cx)))
+            {
+                continue;
+            }
             if !buffers.is_searchable(&buffer.remote_id()) {
                 continue;
             } else if buffer
@@ -671,6 +680,9 @@ impl Search {
             .filter(|buffer| {
                 let b = buffer.read(cx);
                 if let Some(file) = b.file() {
+                    if !search_query.includes_worktree(file.worktree_id(cx)) {
+                        return false;
+                    }
                     if file.disk_state().is_deleted() {
                         return false;
                     }

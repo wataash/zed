@@ -42635,6 +42635,337 @@ async fn test_add_selection_skip_soft_wrap_option(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_set_indentation(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        build_editor(buffer, window, cx)
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    cx.set_state("ˇ");
+    cx.update_editor(|editor, window, cx| {
+        editor.set_indentation(
+            &SetIndentation {
+                tab_size: 3,
+                hard_tabs: false,
+            },
+            window,
+            cx,
+        );
+        assert_eq!(editor.buffer.read(cx).snapshot(cx).text(), "");
+        editor.indent(&Indent, window, cx);
+    });
+    cx.assert_editor_state("   ˇ");
+    cx.update_editor(|editor, window, cx| {
+        editor.undo(&Undo, window, cx);
+        editor.set_indentation(
+            &SetIndentation {
+                tab_size: 8,
+                hard_tabs: true,
+            },
+            window,
+            cx,
+        );
+        editor.indent(&Indent, window, cx);
+    });
+    cx.assert_editor_state("\tˇ");
+    cx.update_editor(|editor, window, cx| {
+        editor.undo(&Undo, window, cx);
+        editor.set_indentation(
+            &SetIndentation {
+                tab_size: 0,
+                hard_tabs: false,
+            },
+            window,
+            cx,
+        );
+        editor.indent(&Indent, window, cx);
+    });
+    cx.assert_editor_state("\tˇ");
+}
+
+// The actual calculation/deduplication algorithms are tested in the extension. This fixture
+// exercises the asynchronous editor boundary independently of a project or language server.
+fn install_test_editor_commands(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        cx.default_global::<extension::editor_commands::EditorCommands>()
+            .0
+            .insert(
+                "myext0".into(),
+                Arc::new(|command, input| {
+                    Box::pin(async move {
+                        let input: zed_editor_command_api::CommandInput =
+                            serde_json::from_str(&input)?;
+                        let date = chrono::DateTime::parse_from_rfc3339(&input.local_time)?;
+                        let replacements = input
+                            .selections
+                            .iter()
+                            .map(|text| {
+                                let replacement = match (command.as_str(), text.as_str()) {
+                                    ("calculate", "1+2") => Some("3.00".to_owned()),
+                                    ("calculate", "2*3") => Some("6.00".to_owned()),
+                                    ("calculate-precise", "1+2/3") => {
+                                        Some("1.6666666666666665".to_owned())
+                                    }
+                                    ("unique-lines", "a\na") => Some("a".to_owned()),
+                                    ("unique-lines", "b\nb") => Some("b".to_owned()),
+                                    ("unique-lines", _) => None,
+                                    ("insert-date", _) => {
+                                        Some(date.format("%Y-%m-%d %a").to_string())
+                                    }
+                                    ("insert-date-time", _) => {
+                                        Some(date.format("%Y-%m-%d %a %H:%M:%S").to_string())
+                                    }
+                                    _ => anyhow::bail!("Invalid fixture input"),
+                                };
+                                Ok(replacement)
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()?;
+                        Ok(serde_json::to_string(
+                            &zed_editor_command_api::CommandOutput {
+                                replacements,
+                                ..Default::default()
+                            },
+                        )?)
+                    })
+                }),
+            );
+    });
+}
+
+#[gpui::test]
+async fn test_personal_selection_actions(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    install_test_editor_commands(cx);
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        build_editor(buffer, window, cx)
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    let original = "«1+2ˇ»\n«2*3ˇ»";
+    cx.set_state(original);
+    cx.update_editor(|editor, window, cx| {
+        editor.calculate_selection(&CalculateSelection, window, cx)
+    });
+    cx.run_until_parked();
+    cx.assert_editor_state("3.00ˇ\n6.00ˇ");
+    cx.update_editor(|editor, window, cx| editor.undo(&Undo, window, cx));
+    cx.assert_editor_state(original);
+    cx.update_editor(|editor, window, cx| editor.redo(&Redo, window, cx));
+    cx.assert_editor_state("3.00ˇ\n6.00ˇ");
+    cx.set_state("«1+2ˇ»\n«invalidˇ»");
+    cx.update_editor(|editor, window, cx| {
+        editor.calculate_selection(&CalculateSelection, window, cx)
+    });
+    cx.run_until_parked();
+    cx.assert_editor_state("«1+2ˇ»\n«invalidˇ»");
+    cx.set_state("«a\naˇ»\n«b\nbˇ»");
+    cx.update_editor(|editor, window, cx| editor.uniq_selection(&UniqSelection, window, cx));
+    cx.run_until_parked();
+    cx.assert_editor_state("aˇ\nbˇ");
+    cx.set_state("«1+2/3ˇ»");
+    cx.update_editor(|editor, window, cx| {
+        editor.precise_calculation(&PreciseCalculation, window, cx)
+    });
+    cx.run_until_parked();
+    cx.assert_editor_state("1.6666666666666665ˇ");
+    cx.set_state(original);
+    cx.update_editor(|editor, window, cx| {
+        editor.set_read_only(true);
+        editor.calculate_selection(&CalculateSelection, window, cx);
+    });
+    cx.run_until_parked();
+    cx.assert_editor_state(original);
+}
+
+#[gpui::test]
+async fn test_personal_clipboard_and_sort_actions(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        build_editor(buffer, window, cx)
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    cx.set_state("```\n日本語ˇ\n```\n");
+    cx.update_editor(|editor, window, cx| {
+        editor.copy_current_code_block(&CopyCurrentCodeBlock, window, cx);
+        let clipboard = cx.read_from_clipboard().expect("copied text");
+        assert!(matches!(clipboard.entries().first(), Some(ClipboardEntry::String(text)) if text.text() == "日本語"));
+    });
+    cx.set_state("ˇ\n«replaceˇ»");
+    cx.update_editor(|editor, window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string("/tmp/日本語 a".into()));
+        editor.insert_clipboard_file_uri(&InsertClipboardFileUri, window, cx);
+    });
+    cx.assert_editor_state("file:///tmp/日本語 aˇ\nfile:///tmp/日本語 aˇ");
+    cx.update_editor(|editor, window, cx| editor.undo(&Undo, window, cx));
+    cx.assert_editor_state("ˇ\n«replaceˇ»");
+    cx.set_state("«a\nc\nBˇ»\nuntouched");
+    cx.update_editor(|editor, window, cx| {
+        editor.sort_lines_descending(&SortLinesDescending, window, cx)
+    });
+    assert_eq!(cx.buffer_text(), "c\na\nB\nuntouched");
+}
+
+#[gpui::test]
+async fn test_personal_selection_actions_skip_unchanged_text(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    install_test_editor_commands(cx);
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        build_editor(buffer, window, cx)
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+
+    // Nothing to deduplicate: no edit is recorded and the selections stay as they were.
+    let unchanged = "«a\nbˇ»\n«cˇ»";
+    cx.set_state(unchanged);
+    let buffer_version = |editor: &Editor, cx: &App| {
+        editor
+            .buffer
+            .read(cx)
+            .as_singleton()
+            .expect("singleton buffer")
+            .read(cx)
+            .version()
+    };
+    let version_before = cx.update_editor(|editor, _, cx| buffer_version(editor, cx));
+    cx.update_editor(|editor, window, cx| editor.uniq_selection(&UniqSelection, window, cx));
+    cx.run_until_parked();
+    cx.assert_editor_state(unchanged);
+    cx.update_editor(|editor, _, cx| assert_eq!(buffer_version(editor, cx), version_before));
+
+    // Mixed: only the duplicated selection is edited and its cursor collapses after the result;
+    // the untouched selection is kept, and a single undo restores everything.
+    let mixed = "«aˇ»\n«b\nbˇ»\n«cˇ»";
+    cx.set_state(mixed);
+    cx.update_editor(|editor, window, cx| editor.uniq_selection(&UniqSelection, window, cx));
+    cx.run_until_parked();
+    cx.assert_editor_state("«aˇ»\nbˇ\n«cˇ»");
+    cx.update_editor(|editor, window, cx| editor.undo(&Undo, window, cx));
+    cx.assert_editor_state(mixed);
+}
+
+#[gpui::test]
+async fn test_tilix_directory(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/root"), json!({ "a.txt": "" })).await;
+    fs.insert_tree(path!("/home"), json!({ "single.txt": "" }))
+        .await;
+
+    // A single-file worktree resolves to the file's parent directory, not the file itself.
+    let project = Project::test(fs.clone(), [path!("/home/single.txt").as_ref()], cx).await;
+    project.read_with(cx, |project, cx| {
+        assert_eq!(
+            Editor::tilix_directory_for_project(project, cx),
+            Some(PathBuf::from(path!("/home")))
+        );
+    });
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        Editor::for_multibuffer(buffer, Some(project.clone()), window, cx)
+    });
+    editor.read_with(cx, |editor, cx| {
+        assert_eq!(
+            editor.tilix_directory(cx),
+            Some(PathBuf::from(path!("/home"))),
+            "an untitled buffer falls back to the project directory"
+        );
+    });
+
+    // A directory worktree is used as is, and the editor's own file directory takes priority.
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    project.read_with(cx, |project, cx| {
+        assert_eq!(
+            Editor::tilix_directory_for_project(project, cx),
+            Some(PathBuf::from(path!("/root")))
+        );
+    });
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/home/single.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        Editor::for_buffer(buffer, Some(project.clone()), window, cx)
+    });
+    editor.read_with(cx, |editor, cx| {
+        assert_eq!(
+            editor.tilix_directory(cx),
+            Some(PathBuf::from(path!("/home")))
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_insert_date_time(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    install_test_editor_commands(cx);
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        build_editor(buffer, window, cx)
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    let original = "日本語«置換ˇ»\n日時ˇ";
+    cx.set_state(original);
+    let before = chrono::Local::now().timestamp();
+    cx.update_editor(|editor, window, cx| editor.insert_date_time(&InsertDateTime, window, cx));
+    cx.run_until_parked();
+    let after = chrono::Local::now().timestamp();
+    let text = cx.buffer_text();
+    let timestamp = text
+        .lines()
+        .next()
+        .expect("first line")
+        .strip_prefix("日本語")
+        .expect("unchanged prefix");
+    assert!((before..=after).any(|seconds| {
+        chrono::DateTime::from_timestamp(seconds, 0)
+            .expect("valid current timestamp")
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %a %H:%M:%S")
+            .to_string()
+            == timestamp
+    }));
+    cx.assert_editor_state(&format!("日本語{timestamp}ˇ\n日時{timestamp}ˇ"));
+    cx.update_editor(|editor, window, cx| editor.undo(&Undo, window, cx));
+    cx.assert_editor_state(original);
+    cx.update_editor(|editor, window, cx| editor.redo(&Redo, window, cx));
+    cx.assert_editor_state(&format!("日本語{timestamp}ˇ\n日時{timestamp}ˇ"));
+    cx.update_editor(|editor, _, _| editor.set_read_only(true));
+    cx.update_editor(|editor, window, cx| editor.insert_date_time(&InsertDateTime, window, cx));
+    cx.run_until_parked();
+    assert_eq!(cx.buffer_text(), text);
+}
+
+#[gpui::test]
+async fn test_insert_date(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    install_test_editor_commands(cx);
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        build_editor(buffer, window, cx)
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    cx.set_state("ˇ");
+    let before = chrono::Local::now().format("%Y-%m-%d %a").to_string();
+    cx.update_editor(|editor, window, cx| editor.insert_date(&InsertDate, window, cx));
+    cx.run_until_parked();
+    let after = chrono::Local::now().format("%Y-%m-%d %a").to_string();
+    let text = cx.buffer_text();
+    assert!(text == before || text == after);
+    cx.assert_editor_state(&format!("{text}ˇ"));
+    cx.update_editor(|editor, window, cx| editor.undo(&Undo, window, cx));
+    cx.assert_editor_state("ˇ");
+    cx.update_editor(|editor, _, _| editor.set_read_only(true));
+    cx.update_editor(|editor, window, cx| editor.insert_date(&InsertDate, window, cx));
+    cx.run_until_parked();
+    cx.assert_editor_state("ˇ");
+}
+
+#[gpui::test]
 async fn test_insert_snippet(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     let mut cx = EditorTestContext::new(cx).await;
@@ -43624,16 +43955,22 @@ async fn test_paste_image_in_markdown_saves_file_and_inserts_markdown(cx: &mut T
 
     let buffer_text = cx.buffer_text();
     assert!(
-        buffer_text.starts_with("![](image") && buffer_text.ends_with(".png)"),
+        buffer_text.starts_with("![](") && buffer_text.ends_with(")"),
         "expected markdown image syntax, got: {buffer_text:?}"
     );
 
     // Cursor should land inside [] so the user can type alt text immediately.
-    let filename_in_parens = &buffer_text["![](".len()..buffer_text.len() - 1];
-    let expected_state = format!("![ˇ]({filename_in_parens})");
-    cx.assert_editor_state(&expected_state);
-
     let filename = &buffer_text["![](".len()..buffer_text.len() - 1];
+    cx.assert_editor_state(&format!("![ˇ]({filename})"));
+
+    // `{document stem}.{UTC YYMMDDhhmmss}.{extension}`, as in VS Code's
+    // `markdown.copyFiles.destination`. The exact timestamp depends on when
+    // the test runs, so only its shape is checked.
+    let filename_pattern = regex::Regex::new(r"^test\.\d{12}\.png$").unwrap();
+    assert!(
+        filename_pattern.is_match(filename),
+        "unexpected image filename: {filename:?}"
+    );
     assert_eq!(
         fs.read_file_sync(format!("/test/{filename}")).unwrap(),
         png_bytes,
@@ -43680,52 +44017,70 @@ async fn test_paste_multiple_images_in_markdown_increments_filename(cx: &mut Tes
     cx.run_until_parked();
     let mut cx = EditorTestContext::for_editor(editor_window, cx).await;
 
-    let png_bytes_1: Vec<u8> = vec![1, 2, 3, 4, 5];
-    let png_bytes_2: Vec<u8> = vec![6, 7, 8, 9, 10];
-    let png_bytes_3: Vec<u8> = vec![11, 12, 13, 14, 15];
-    let image_1 = gpui::Image::from_bytes(gpui::ImageFormat::Png, png_bytes_1.clone());
-    let image_2 = gpui::Image::from_bytes(gpui::ImageFormat::Png, png_bytes_2.clone());
-    let image_3 = gpui::Image::from_bytes(gpui::ImageFormat::Png, png_bytes_3.clone());
+    // Pasting several images in a row must never overwrite an earlier one. When
+    // pastes share a timestamp the name gets `_1`, `_2`, ... before the
+    // extension; when the clock ticks over between pastes the timestamps
+    // differ instead. Either way every paste gets its own file.
+    let filename_pattern = regex::Regex::new(r"^(test\.\d{12})(?:_(\d+))?\.png$").unwrap();
+    let link_pattern = regex::Regex::new(r"!\[[^\]]*\]\(([^()]*)\)").unwrap();
 
-    // Paste first image — should produce image.png
     cx.set_state("ˇ");
-    cx.update_editor(|editor, window, cx| {
-        cx.write_to_clipboard(ClipboardItem::new_image(&image_1));
-        editor.paste(&Paste, window, cx);
-    });
-    cx.run_until_parked();
-    let text_after_first = cx.buffer_text();
-    assert_eq!(
-        text_after_first, "![](image.png)",
-        "first paste should produce image.png"
-    );
-    assert_eq!(fs.read_file_sync("/test/image.png").unwrap(), png_bytes_1);
+    let mut filenames: Vec<String> = Vec::new();
+    for png_bytes in [vec![1, 2, 3, 4, 5], vec![6, 7, 8, 9, 10], vec![11, 12, 13]] {
+        let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, png_bytes.clone());
+        cx.update_editor(|editor, window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_image(&image));
+            editor.paste(&Paste, window, cx);
+        });
+        cx.run_until_parked();
 
-    // Paste second image at end — should produce image_1.png
-    cx.update_editor(|editor, window, cx| {
-        cx.write_to_clipboard(ClipboardItem::new_image(&image_2));
-        editor.paste(&Paste, window, cx);
-    });
-    cx.run_until_parked();
-    let text_after_second = cx.buffer_text();
-    assert!(
-        text_after_second.contains("![](image_1.png)"),
-        "second paste should produce image_1.png, got: {text_after_second:?}"
-    );
-    assert_eq!(fs.read_file_sync("/test/image_1.png").unwrap(), png_bytes_2);
+        let buffer_text = cx.buffer_text();
+        let new_filenames: Vec<String> = link_pattern
+            .captures_iter(&buffer_text)
+            .map(|captures| captures[1].to_string())
+            .filter(|filename| !filenames.contains(filename))
+            .collect();
+        assert_eq!(
+            new_filenames.len(),
+            1,
+            "each paste should insert exactly one new image link, got: {buffer_text:?}"
+        );
+        let filename = new_filenames.into_iter().next().unwrap();
+        assert!(
+            filename_pattern.is_match(&filename),
+            "unexpected image filename: {filename:?}"
+        );
+        assert_eq!(
+            fs.read_file_sync(format!("/test/{filename}")).unwrap(),
+            png_bytes,
+            "{filename} should contain the bytes of the paste that created it"
+        );
+        filenames.push(filename);
+    }
 
-    // Paste third image — should produce image_2.png
-    cx.update_editor(|editor, window, cx| {
-        cx.write_to_clipboard(ClipboardItem::new_image(&image_3));
-        editor.paste(&Paste, window, cx);
-    });
-    cx.run_until_parked();
-    let text_after_third = cx.buffer_text();
-    assert!(
-        text_after_third.contains("![](image_2.png)"),
-        "third paste should produce image_2.png, got: {text_after_third:?}"
-    );
-    assert_eq!(fs.read_file_sync("/test/image_2.png").unwrap(), png_bytes_3);
+    // Within a run of pastes that share a timestamp, the counter must count up
+    // from `_1` without gaps.
+    for pair in filenames.windows(2) {
+        let previous = filename_pattern.captures(&pair[0]).unwrap();
+        let current = filename_pattern.captures(&pair[1]).unwrap();
+        if previous[1] != current[1] {
+            continue;
+        }
+        let counter = |captures: &regex::Captures<'_>| -> u32 {
+            captures
+                .get(2)
+                .map_or(0, |counter| counter.as_str().parse().unwrap())
+        };
+        assert_eq!(
+            counter(&current),
+            counter(&previous) + 1,
+            "expected {:?} to be followed by {}_{}.png, got {:?}",
+            pair[0],
+            &previous[1],
+            counter(&previous) + 1,
+            pair[1]
+        );
+    }
 }
 
 #[gpui::test]
@@ -43834,8 +44189,9 @@ async fn test_paste_image_in_markdown_single_file_worktree_falls_through(cx: &mu
     cx.run_until_parked();
 
     cx.assert_editor_state("ˇ");
-    assert!(
-        fs.read_file_sync("/root/image.png").is_err(),
+    assert_eq!(
+        fs.files(),
+        vec![PathBuf::from("/root/test.md")],
         "no image file should be created for a single-file worktree"
     );
 }
@@ -50736,4 +51092,705 @@ async fn test_soft_wrap_indent_updated_on_file_move_between_directories(
         .update(cx, |editor, window, cx| editor.snapshot(window, cx))
         .unwrap();
     assert_eq!(snapshot.soft_wrap_indent(DisplayRow(0)), Some(0));
+}
+
+#[gpui::test]
+async fn test_personal_vscode_sort_code_action(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    for (descending, generic) in [(false, false), (true, false), (false, true)] {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_file(path!("/file.rs"), "saved text\n".into())
+            .await;
+        let project = Project::test(fs.clone(), [path!("/").as_ref()], cx).await;
+        let registry = project.read_with(cx, |project, _| project.languages().clone());
+        registry.add(rust_lang());
+        let mut servers = registry.register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                capabilities: lsp::ServerCapabilities {
+                    code_action_provider: Some(lsp::CodeActionProviderCapability::Simple(true)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let source = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/file.rs"), cx)
+            })
+            .await
+            .expect("buffer");
+        let multibuffer = cx.new(|cx| MultiBuffer::singleton(source.clone(), cx));
+        let (editor, cx) = cx.add_window_view(|window, cx| {
+            build_editor_with_project(project.clone(), multibuffer, window, cx)
+        });
+        let server = servers.next().await.expect("sort server");
+        let requested = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let expected = if descending { "z\nö\no" } else { "o\nö\nz" };
+        let kind = if generic {
+            "refactor.rewrite.fixture.custom"
+        } else if descending {
+            "refactor.rewrite.myext0.sortDescending"
+        } else {
+            "refactor.rewrite.myext0.sortAscending"
+        };
+        server.set_request_handler::<lsp::request::CodeActionRequest, _, _>({
+            let requested = requested.clone();
+            move |params, _| {
+                let requested = requested.clone();
+                async move {
+                    if params.context.only.is_none() {
+                        return Ok(None);
+                    }
+                    assert_eq!(params.context.only, Some(vec![kind.into()]));
+                    assert_eq!(
+                        params.range,
+                        lsp::Range::new(lsp::Position::new(1, 1), lsp::Position::new(4, 0))
+                    );
+                    requested.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Some(vec![
+                        lsp::CodeActionOrCommand::CodeAction(lsp::CodeAction {
+                            title: "Unrelated first candidate".into(),
+                            kind: Some(lsp::CodeActionKind::SOURCE_FIX_ALL),
+                            ..Default::default()
+                        }),
+                        lsp::CodeActionOrCommand::CodeAction(lsp::CodeAction {
+                            title: "VS Code-compatible sort".into(),
+                            kind: Some(kind.into()),
+                            edit: Some(lsp::WorkspaceEdit::new(
+                                [(
+                                    params.text_document.uri,
+                                    vec![lsp::TextEdit::new(
+                                        lsp::Range::new(
+                                            lsp::Position::new(1, 0),
+                                            lsp::Position::new(3, 1),
+                                        ),
+                                        expected.into(),
+                                    )],
+                                )]
+                                .into_iter()
+                                .collect(),
+                            )),
+                            ..Default::default()
+                        }),
+                    ]))
+                }
+            }
+        });
+        let original = "prefix\nz\no\nö\nsuffix\n";
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text(original, window, cx);
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([Point::new(1, 1)..Point::new(4, 0)]);
+            });
+            if generic {
+                editor.execute_code_action(
+                    &ExecuteCodeAction {
+                        kind: kind.into(),
+                        select_lines: true,
+                    },
+                    window,
+                    cx,
+                );
+            } else {
+                editor.sort_lines_like_vs_code(&SortLinesLikeVsCode { descending }, window, cx);
+            }
+        });
+        cx.run_until_parked();
+        assert_eq!(requested.load(std::sync::atomic::Ordering::SeqCst), 1);
+        editor.update_in(cx, |editor, window, cx| {
+            assert_eq!(editor.text(cx), format!("prefix\n{expected}\nsuffix\n"));
+            assert!(source.read(cx).is_dirty());
+            let selected = editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx));
+            assert_eq!(selected.start, Point::new(1, 0));
+            assert_eq!(selected.end, Point::new(3, 1));
+            editor.undo(&Undo, window, cx);
+            assert_eq!(editor.text(cx), original);
+            editor.redo(&Redo, window, cx);
+            assert_eq!(editor.text(cx), format!("prefix\n{expected}\nsuffix\n"));
+        });
+        assert_eq!(
+            fs.load(path!("/file.rs").as_ref())
+                .await
+                .expect("saved file"),
+            "saved text\n"
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_personal_create_x_file(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    cx.update(|cx| register_project_item::<Editor>(cx));
+    for existing in [None, Some("protected contents")] {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/notes", json!({"music-sessions.md": "source contents"}))
+            .await;
+        if let Some(contents) = existing {
+            fs.insert_file("/notes/music-sessions.x.md", contents.as_bytes().to_vec())
+                .await;
+        }
+        let project = Project::test(fs.clone(), ["/notes".as_ref()], cx).await;
+        let (window, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window.read_with(cx, |mw, _| mw.workspace().clone());
+        let source = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    "/notes/music-sessions.md".into(),
+                    Default::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("source file")
+            .downcast::<Editor>()
+            .expect("source editor");
+        source.update_in(cx, |editor, window, cx| {
+            editor.set_text("unsaved source", window, cx)
+        });
+        cx.dispatch_action(actions::CreateXFile);
+        cx.run_until_parked();
+        let active = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_item_as::<Editor>(cx).expect("X editor")
+        });
+        active.update_in(cx, |editor, _, cx| {
+            assert_eq!(
+                editor.target_file_abs_path(cx),
+                Some("/notes/music-sessions.x.md".into())
+            );
+            assert_eq!(editor.text(cx), existing.unwrap_or(""));
+        });
+        assert_eq!(
+            fs.load(Path::new("/notes/music-sessions.x.md"))
+                .await
+                .expect("X contents"),
+            existing.unwrap_or("")
+        );
+        assert_eq!(
+            fs.load(Path::new("/notes/music-sessions.md"))
+                .await
+                .expect("source contents"),
+            "source contents"
+        );
+        // Repeating the action on an X file must not make an X-of-X file.
+        cx.dispatch_action(actions::CreateXFile);
+        cx.run_until_parked();
+        assert!(!fs.is_file(Path::new("/notes/music-sessions.x.x.md")).await);
+    }
+}
+
+#[gpui::test]
+async fn test_personal_extension_command_rejects_stale_results(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    cx.update(|cx| {
+        cx.default_global::<extension::editor_commands::EditorCommands>()
+            .0
+            .insert(
+                "fixture".into(),
+                Arc::new(|command, _| {
+                    Box::pin(async move {
+                        Ok(match command.as_str() {
+                            "wrong-count" => r#"{"replacements":[null,null]}"#,
+                            "malformed" => "invalid JSON",
+                            _ => r#"{"replacements":["result"]}"#,
+                        }
+                        .to_owned())
+                    })
+                }),
+            );
+    });
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        build_editor(buffer, window, cx)
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    for command in [
+        "wrong-count",
+        "malformed",
+        "selection",
+        "document",
+        "read-only",
+        "missing",
+    ] {
+        cx.update_editor(|editor, _, _| editor.set_read_only(false));
+        cx.set_state("«inputˇ»");
+        cx.update_editor(|editor, window, cx| {
+            editor.execute_extension_command(
+                &ExecuteExtensionCommand {
+                    extension: if command == "missing" {
+                        "missing"
+                    } else {
+                        "fixture"
+                    }
+                    .into(),
+                    command: command.into(),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+            if command == "read-only" {
+                editor.set_read_only(true);
+            }
+        });
+        let expected = match command {
+            "selection" => "inˇput",
+            "document" => "changedˇ",
+            _ => "«inputˇ»",
+        };
+        if matches!(command, "selection" | "document") {
+            cx.set_state(expected);
+        }
+        cx.run_until_parked();
+        cx.assert_editor_state(expected);
+    }
+    cx.update_editor(|editor, _, _| editor.set_read_only(false));
+    cx.set_state("«inputˇ»");
+    cx.update_editor(|editor, window, cx| {
+        editor.execute_extension_command(
+            &ExecuteExtensionCommand {
+                extension: "fixture".into(),
+                command: "replace".into(),
+                ..Default::default()
+            },
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.assert_editor_state("resultˇ");
+    cx.update_editor(|editor, window, cx| editor.undo(&Undo, window, cx));
+    cx.assert_editor_state("«inputˇ»");
+}
+
+#[gpui::test]
+async fn test_personal_extension_context_and_effects(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    cx.update(|cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string("clipboard input".into()));
+        cx.default_global::<extension::editor_commands::EditorCommands>().0.insert("fixture".into(), Arc::new(|command, input| Box::pin(async move {
+            let input: zed_editor_command_api::CommandInput = serde_json::from_str(&input)?;
+            assert_eq!(input.arguments, serde_json::json!({"option": 7}));
+            assert_eq!(input.context.document.as_deref(), Some("日 a"));
+            assert_eq!(input.context.clipboard.as_deref(), Some("clipboard input"));
+            assert_eq!(input.context.selections.first().map(|range| (range.start, range.end)), Some((0, 3)));
+            assert!(input.host_capabilities.iter().any(|value| value == "byte_edits"));
+            Ok(match command.as_str() {
+                "replace" => r#"{"edits":[{"range":{"start":0,"end":3},"text":"日本語"}],"selections":[{"start":0,"end":9}],"effects":[{"kind":"clipboard","text":"copied"},{"kind":"set_indentation","tab_size":3,"hard_tabs":true}]}"#,
+                "invalid" => r#"{"edits":[{"range":{"start":1,"end":3},"text":"x"}],"effects":[{"kind":"clipboard","text":"must not copy"}]}"#,
+                _ => r#"{"effects":[{"kind":"clipboard","text":"read-only copy"}]}"#,
+            }.to_owned())
+        })));
+    });
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        build_editor(buffer, window, cx)
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    let action = |command: &str| ExecuteExtensionCommand {
+        extension: "fixture".into(),
+        command: command.into(),
+        arguments: serde_json::json!({"option": 7}),
+        context: serde_json::json!({"document": true, "clipboard": true}),
+    };
+    for command in ["invalid", "copy", "replace"] {
+        cx.set_state("«日ˇ» a");
+        cx.update_editor(|editor, window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string("clipboard input".into()));
+            editor.set_read_only(command == "copy");
+            editor.execute_extension_command(&action(command), window, cx);
+        });
+        cx.run_until_parked();
+        cx.assert_editor_state(if command == "replace" {
+            "«日本語ˇ» a"
+        } else {
+            "«日ˇ» a"
+        });
+        cx.update_editor(|_, _, cx| {
+            assert_eq!(
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some(match command {
+                    "replace" => "copied",
+                    "copy" => "read-only copy",
+                    _ => "clipboard input",
+                })
+            )
+        });
+    }
+    cx.update_editor(|editor, window, cx| editor.undo(&Undo, window, cx));
+    cx.assert_editor_state("«日ˇ» a");
+}
+
+#[gpui::test]
+async fn test_personal_extension_file_effects(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    cx.update(|cx| {
+        register_project_item::<Editor>(cx);
+        cx.default_global::<extension::editor_commands::EditorCommands>().0.insert("fixture".into(), Arc::new(|_, input| Box::pin(async move {
+            let input: zed_editor_command_api::CommandInput = serde_json::from_str(&input)?;
+            assert_eq!(input.context.path.as_deref(), Some("/notes/source.md"));
+            assert!(input.context.roots.iter().any(|path| path == "/notes"));
+            Ok(r#"{"effects":[{"kind":"create_file","path":"/notes/new.md","text":"@scrap\n"},{"kind":"open_file","path":"/notes/new.md"},{"kind":"dispatch_action","name":"editor::MoveToEnd"}]}"#.into())
+        })));
+    });
+    for existing in [true, false] {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/notes", json!({"source.md":"source"}))
+            .await;
+        if existing {
+            fs.insert_file("/notes/new.md", b"protected".to_vec()).await;
+        }
+        let project = Project::test(fs.clone(), ["/notes".as_ref()], cx).await;
+        let (window, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window.read_with(cx, |mw, _| mw.workspace().clone());
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path("/notes/source.md".into(), Default::default(), window, cx)
+            })
+            .await
+            .expect("source");
+        cx.dispatch_action(ExecuteExtensionCommand {
+            extension: "fixture".into(),
+            command: "files".into(),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        let active = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item_as::<Editor>(cx)
+                .expect("target editor")
+        });
+        active.update_in(cx, |editor, _, cx| {
+            assert_eq!(
+                editor.target_file_abs_path(cx),
+                Some("/notes/new.md".into())
+            );
+            assert_eq!(
+                editor.text(cx),
+                if existing { "protected" } else { "@scrap\n" }
+            );
+            let selection = editor
+                .selections
+                .newest::<MultiBufferOffset>(&editor.display_snapshot(cx));
+            assert_eq!(
+                selection.start.0..selection.end.0,
+                (if existing { 9 } else { 7 })..(if existing { 9 } else { 7 })
+            );
+        });
+        assert_eq!(
+            fs.load(Path::new("/notes/new.md")).await.expect("file"),
+            if existing { "protected" } else { "@scrap\n" }
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_personal_extension_clipboard_image(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    cx.update(|cx| {
+        // The bridge transports encoded bytes without decoding them; image codecs are tested separately.
+        cx.write_to_clipboard(ClipboardItem::new_image(&gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![1, 2, 3])));
+        cx.default_global::<extension::editor_commands::EditorCommands>().0.insert("fixture".into(), Arc::new(|_, input| Box::pin(async move {
+            let input: zed_editor_command_api::CommandInput = serde_json::from_str(&input)?;
+            let image = input.context.clipboard_image.expect("requested image");
+            assert_eq!(image.mime_type, "image/png");
+            assert_eq!(image.bytes, [1, 2, 3]);
+            Ok(r#"{"effects":[{"kind":"clipboard_image","mime_type":"image/webp","bytes":[4,5]}]}"#.into())
+        })));
+    });
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("", cx);
+        build_editor(buffer, window, cx)
+    });
+    let mut cx = EditorTestContext::for_editor(editor, cx).await;
+    cx.update_editor(|editor, window, cx| {
+        editor.execute_extension_command(
+            &ExecuteExtensionCommand {
+                extension: "fixture".into(),
+                command: "image".into(),
+                context: json!({"clipboard_image":true}),
+                ..Default::default()
+            },
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.update_editor(|_, _, cx| {
+        let item = cx.read_from_clipboard().expect("output image");
+        assert!(matches!(item.entries().first(), Some(ClipboardEntry::Image(image)) if image.format == gpui::ImageFormat::Webp && image.bytes == [4,5]));
+    });
+}
+
+#[gpui::test]
+async fn test_personal_extension_image_paste(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    cx.update(|cx| cx.update_global::<SettingsStore, _>(|store, cx| {
+        store.update_user_settings(cx, |settings| {
+            settings.project.zhack = Some(serde_json::from_value(json!({"markdown":{"image_paste":{"filename_template":"custom image.png"}}})).expect("image settings"));
+        });
+    }));
+
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/test", serde_json::json!({"test.md": ""}))
+        .await;
+    let project = Project::test(fs.clone(), [std::path::Path::new("/test")], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer("/test/test.md", cx)
+        })
+        .await
+        .expect("local buffer");
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_language(Some(markdown_language), cx);
+    });
+
+    let editor_window = cx.add_window(|window, cx| {
+        let editor = build_editor_with_project(
+            project,
+            MultiBuffer::build_from_buffer(buffer, cx),
+            window,
+            cx,
+        );
+        window.focus(&editor.focus_handle(cx), cx);
+        editor
+    });
+    cx.run_until_parked();
+    let mut cx = EditorTestContext::for_editor(editor_window, cx).await;
+
+    cx.update_editor(|_, _, cx| {
+        let registry = cx.default_global::<extension::editor_commands::EditorCommands>();
+        registry.1.insert("fixture".into(), [("paste-markdown-image".into(), serde_json::from_value(json!({"context":{"clipboard_image":true,"omit_selection_text":true}})).expect("definition"))].into_iter().collect());
+        registry.0.insert("fixture".into(), Arc::new(|command, input| Box::pin(async move {
+            assert_eq!(command, "paste-markdown-image");
+            let input: zed_editor_command_api::CommandInput = serde_json::from_str(&input)?;
+            assert_eq!(input.context.path.as_deref(), Some("/test/test.md"));
+            assert_eq!(input.arguments["template"], "custom image.png");
+            let image = input.context.clipboard_image.expect("image context");
+            Ok(json!({"effects":[{"kind":"insert_image", "file_name":"custom image.png", "mime_type":image.mime_type,"bytes":image.bytes}]}).to_string())
+        })));
+    });
+    let png_bytes: Vec<u8> = vec![1, 2, 3, 4, 5];
+    let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, png_bytes.clone());
+
+    cx.set_state("ˇ");
+    cx.update_editor(|editor, window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_image(&image));
+        editor.paste(&Paste, window, cx);
+    });
+    cx.run_until_parked();
+
+    let buffer_text = cx.buffer_text();
+    assert!(
+        buffer_text.starts_with("![](") && buffer_text.ends_with(")"),
+        "expected markdown image syntax, got: {buffer_text:?}"
+    );
+
+    // Cursor should land inside [] so the user can type alt text immediately.
+    let filename = &buffer_text["![](".len()..buffer_text.len() - 1];
+    cx.assert_editor_state(&format!("![ˇ]({filename})"));
+
+    assert_eq!(filename, "custom%20image.png");
+    assert_eq!(
+        fs.read_file_sync("/test/custom image.png")
+            .expect("saved image"),
+        png_bytes,
+        "image file contents should match clipboard bytes"
+    );
+
+    cx.update_editor(|editor, window, cx| editor.undo(&Undo, window, cx));
+    cx.run_until_parked();
+    assert!(fs.read_file_sync("/test/custom image.png").is_err());
+    assert_eq!(cx.buffer_text(), "");
+    cx.update_editor(|editor, window, cx| editor.redo(&Redo, window, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        fs.read_file_sync("/test/custom image.png")
+            .expect("restored image"),
+        png_bytes
+    );
+    assert_eq!(cx.buffer_text(), "![](custom%20image.png)");
+
+    // Rapid requests must preserve ordering even while filesystem operations await.
+    cx.update_editor(|editor, window, cx| {
+        editor.undo(&Undo, window, cx);
+        editor.redo(&Redo, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        fs.read_file_sync("/test/custom image.png")
+            .expect("rapid redo"),
+        png_bytes
+    );
+
+    fs::Fs::write(fs.as_ref(), Path::new("/test/custom image.png"), &[9, 8])
+        .await
+        .expect("external change");
+    // Undo through the underlying buffer also covers a different view of this file.
+    cx.update_buffer(|buffer, cx| {
+        buffer.undo(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        fs.read_file_sync("/test/custom image.png")
+            .expect("preserved change"),
+        [9, 8]
+    );
+
+    cx.update_editor(|editor, window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_image(&image));
+        editor.paste(&Paste, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        fs.read_file_sync("/test/custom image_1.png")
+            .expect("distinct image"),
+        png_bytes
+    );
+    cx.update_editor(|editor, window, cx| editor.undo(&Undo, window, cx));
+    cx.run_until_parked();
+    fs::Fs::write(fs.as_ref(), Path::new("/test/custom image_1.png"), &[7])
+        .await
+        .expect("new occupant");
+    cx.update_editor(|editor, window, cx| editor.redo(&Redo, window, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        fs.read_file_sync("/test/custom image_1.png")
+            .expect("no overwrite"),
+        [7]
+    );
+}
+
+#[gpui::test]
+async fn test_personal_file_open_hook_git_diff_source(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    init_test(cx, |_| {});
+    cx.update(|cx| cx.update_global::<SettingsStore, _>(|store, cx| {
+        store.update_user_settings(cx, |settings| {
+            settings.project.zhack = Some(serde_json::from_value(json!({
+                "on_file_open": [{"extension":"fixture", "command":"configure-diff", "context":{"omit_selection_text":true}}]
+            })).expect("hook settings"));
+        });
+    }));
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/test", json!({".git":{}, ".gitignore":"*.x.*\nhistory/\n", "note.x.md":"saved\n", "history":{".git":{}, "note.x.md":"saved\n"}})).await;
+    fs.set_head_and_index_for_repo(std::path::Path::new("/test/.git"), &[]);
+    fs.set_head_and_index_for_repo(
+        std::path::Path::new("/test/history/.git"),
+        &[("note.x.md", "baseline\n".into())],
+    );
+    let project = Project::test(fs, [std::path::Path::new("/test")], cx).await;
+    let source = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer("/test/note.x.md", cx)
+        })
+        .await
+        .expect("source buffer");
+    let editor_window = cx.add_window(|window, cx| {
+        let editor = build_editor_with_project(
+            project,
+            MultiBuffer::build_from_buffer(source.clone(), cx),
+            window,
+            cx,
+        );
+        window.focus(&editor.focus_handle(cx), cx);
+        editor
+    });
+    cx.run_until_parked();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = cx.executor().clone();
+    cx.update(|cx| {
+        let calls = calls.clone();
+        cx.default_global::<extension::editor_commands::EditorCommands>().0.insert("fixture".into(), Arc::new(move |command, input| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let executor = executor.clone();
+            Box::pin(async move {
+                assert_eq!(command,"configure-diff");
+                let input: zed_editor_command_api::CommandInput = serde_json::from_str(&input)?;
+                assert_eq!(input.context.path.as_deref(),Some("/test/note.x.md"));
+                assert!(input.context.document.is_none());
+                assert!(input.selections.iter().all(String::is_empty));
+                executor.timer(Duration::from_millis(10)).await;
+                Ok(json!({"effects":[{"kind":"git_diff_source", "source":{"repository":"/test/history", "path":"note.x.md"}}]}).to_string())
+            })
+        }));
+        cx.default_global::<extension::editor_commands::EditorCommands>();
+    });
+    cx.run_until_parked();
+    source.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "unsaved\n")], None, cx)
+    });
+    cx.executor().advance_clock(Duration::from_millis(10));
+    cx.run_until_parked();
+    editor_window
+        .root(cx)
+        .expect("editor root")
+        .update(cx, |editor, cx| {
+            let diff = editor
+                .buffer
+                .read(cx)
+                .diff_for(source.read(cx).remote_id())
+                .expect("gutter diff");
+            assert_eq!(
+                diff.read(cx).base_text_string(cx),
+                Some("baseline\n".into())
+            );
+            assert!(diff.read(cx).operations().is_none());
+            assert_eq!(editor.text(cx), "unsaved\nsaved\n");
+        });
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    cx.update(|cx| {
+        cx.default_global::<extension::editor_commands::EditorCommands>();
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "unchanged providers must not rerun hooks"
+    );
+    // Reloading the extension reruns its hooks and can clear an earlier decision.
+    cx.update(|cx| {
+        cx.default_global::<extension::editor_commands::EditorCommands>()
+            .0
+            .insert(
+                "fixture".into(),
+                Arc::new(|_, _| {
+                    Box::pin(async {
+                        Ok(
+                            json!({"effects":[{"kind":"git_diff_source", "source":null}]})
+                                .to_string(),
+                        )
+                    })
+                }),
+            );
+        cx.default_global::<extension::editor_commands::EditorCommands>();
+    });
+    cx.run_until_parked();
+    editor_window
+        .root(cx)
+        .expect("editor root")
+        .update(cx, |editor, cx| {
+            let diff = editor
+                .buffer
+                .read(cx)
+                .diff_for(source.read(cx).remote_id())
+                .expect("normal diff");
+            assert_eq!(diff.read(cx).base_text_string(cx), None);
+            assert!(diff.read(cx).operations().is_some());
+        });
 }

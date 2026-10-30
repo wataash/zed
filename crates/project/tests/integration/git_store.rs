@@ -1,3 +1,152 @@
+mod alternate_diff_tests {
+    use std::time::Duration;
+
+    use fs::FakeFs;
+    use gpui::{TestAppContext, UpdateGlobal};
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
+
+    use crate::Project;
+
+    #[gpui::test]
+    async fn test_alternate_git_diff_root(cx: &mut TestAppContext) {
+        crate::init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.zhack = Some(
+                        serde_json::from_value(json!({
+                            "watch_exclusions": ["**/.git"]
+                        }))
+                        .expect("alternate diff settings"),
+                    );
+                });
+            });
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {}, ".gitignore": "*.x.*\nx3/\n",
+                "c3": {"note.x.md": "saved\n", "public.md": "public edited\n"},
+                "x3": {".git": {}, "note.x.md": "saved\n"}
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            path!("/root/.git").as_ref(),
+            &[("c3/public.md", "public base\n".into())],
+        );
+        fs.set_head_and_index_for_repo(
+            path!("/root/x3/.git").as_ref(),
+            &[("note.x.md", "private base\n".into())],
+        );
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/root/c3/note.x.md"), cx)
+            })
+            .await
+            .expect("private buffer");
+        let git_store = project.read_with(cx, |project, _| project.git_store().clone());
+        git_store
+            .update(cx, |store, cx| {
+                store.set_buffer_diff_source(
+                    buffer.read(cx).remote_id(),
+                    Some(project::git_store::GitDiffSource {
+                        repository: path!("/root/x3").into(),
+                        path: "note.x.md".into(),
+                    }),
+                    cx,
+                )
+            })
+            .expect("set alternate source");
+        let diff = git_store
+            .update(cx, |store, cx| store.open_display_diff(buffer.clone(), cx))
+            .await
+            .expect("alternate diff");
+        cx.run_until_parked();
+        assert_eq!(
+            diff.read_with(cx, |diff, cx| diff.base_text_string(cx)),
+            Some("private base\n".into())
+        );
+        assert!(diff.read_with(cx, |diff, _| diff.operations().is_none()));
+        let secondary = diff.read_with(cx, |diff, _| diff.secondary_diff().expect("index diff"));
+        assert!(secondary.read_with(cx, |diff, _| diff.operations().is_none()));
+        assert!(
+            git_store
+                .update(cx, |store, cx| store.stage_hunks(
+                    buffer.clone(),
+                    secondary,
+                    vec![],
+                    cx
+                ))
+                .is_err()
+        );
+        // Repository ownership stays on the original path; only diff reads are mapped.
+        let original = git_store
+            .read_with(cx, |store, cx| {
+                store.repository_and_path_for_buffer_id(buffer.read(cx).remote_id(), cx)
+            })
+            .expect("source repository");
+        assert_eq!(original.1.as_unix_str(), "c3/note.x.md");
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "unsaved\n")], None, cx)
+        });
+        cx.run_until_parked();
+        let hunks = diff.read_with(cx, |diff, cx| {
+            diff.snapshot(cx)
+                .hunks(&buffer.read(cx).text_snapshot())
+                .count()
+        });
+        assert!(hunks > 0, "unsaved edits must affect the gutter");
+        // A commit in the target repository refreshes the original buffer's baseline.
+        fs.set_index_for_repo(
+            path!("/root/x3/.git").as_ref(),
+            &[("note.x.md", "unsaved\nsaved\n".into())],
+        );
+        fs.set_head_for_repo(
+            path!("/root/x3/.git").as_ref(),
+            &[("note.x.md", "unsaved\nsaved\n".into())],
+            "updated-head",
+        );
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            diff.read_with(cx, |diff, cx| diff.base_text_string(cx)),
+            Some("unsaved\nsaved\n".into())
+        );
+        assert_eq!(
+            diff.read_with(cx, |diff, cx| diff
+                .snapshot(cx)
+                .hunks(&buffer.read(cx).text_snapshot())
+                .count()),
+            0
+        );
+        let public = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/root/c3/public.md"), cx)
+            })
+            .await
+            .expect("public buffer");
+        let public_diff = git_store
+            .update(cx, |store, cx| store.open_display_diff(public, cx))
+            .await
+            .expect("normal diff");
+        assert_eq!(
+            public_diff.read_with(cx, |diff, cx| diff.base_text_string(cx)),
+            Some("public base\n".into())
+        );
+        assert!(public_diff.read_with(cx, |diff, _| diff.operations().is_some()));
+        assert_eq!(
+            project.read_with(cx, |project, cx| project.visible_worktrees(cx).count()),
+            1
+        );
+    }
+}
+
 mod conflict_set_tests {
     use std::sync::mpsc;
 

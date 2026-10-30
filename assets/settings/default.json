@@ -615,6 +615,8 @@
   "fullscreen_mode": "native",
   // Titlebar related settings
   "title_bar": {
+    // Tint the title bar with a stable color for the workspace's first project root.
+    "workspace_color": true,
     // Whether to show git status indicators on the branch icon in the titlebar.
     "show_branch_status_icon": false,
     // Whether to show the branch name button in the titlebar.
@@ -1609,6 +1611,21 @@
     // Default: true
     "prefill_query_from_selection": true,
   },
+  "zhack": {
+    // Linux directory watches to omit, except minimal Git metadata watches.
+    // Files remain visible; external changes may not be detected automatically.
+    // Recursive and polling watchers cannot omit individual subtrees.
+    "watch_exclusions": [],
+    "search": {
+      // Extra local roots included by repeating Ctrl+P or Ctrl+Shift+F.
+      // May also be set per project; paths are absolute, ~/ or root-relative.
+      "additional_roots": [],
+      // Walk ignored directories not yet loaded when opening the file finder.
+      "all_files": false,
+      // Exclude paths from file finder results, history, and project search.
+      "exclusions": [],
+    },
+  },
   // Whether or not to remove any trailing whitespace from lines of a buffer
   // before saving it.
   "remove_trailing_whitespace_on_save": true,
@@ -1725,6 +1742,16 @@
   //
   // Default: false
   "disable_ai": false,
+  // Enables or disables AI for worktrees under the given directories, overriding
+  // `disable_ai`. The deepest listed directory wins, and `disable_ai_in_directories`
+  // wins for a directory listed in both. While any open worktree resolves to disabled,
+  // AI is disabled everywhere. For example, with `"disable_ai": true`,
+  // `"enable_ai_in_directories": ["~/src/oss"]` enables AI only there.
+  //
+  // Default: []
+  "enable_ai_in_directories": [],
+  // Default: []
+  "disable_ai_in_directories": [],
   // Automatically update Zed. This setting may be ignored on Linux if
   // installed through a package manager.
   "auto_update": true,

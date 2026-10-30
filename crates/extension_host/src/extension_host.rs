@@ -1397,6 +1397,7 @@ impl ExtensionStore {
         let mut grammars_to_remove = Vec::new();
         let mut server_removal_tasks = Vec::with_capacity(extensions_to_unload.len());
         for extension_id in &extensions_to_unload {
+            extension::editor_commands::unregister(extension_id, cx);
             let Some(extension) = old_index.extensions.get(extension_id) else {
                 continue;
             };
@@ -1677,6 +1678,7 @@ impl ExtensionStore {
 
                 for (manifest, wasm_extension) in &wasm_extensions {
                     let extension = Arc::new(wasm_extension.clone());
+                    extension::editor_commands::register(extension.clone(), cx);
 
                     for (language_server_id, language_server_config) in &manifest.language_servers {
                         for language in language_server_config.languages() {

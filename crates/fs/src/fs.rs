@@ -105,6 +105,8 @@ pub trait Fs: Send + Sync {
     async fn create_dir(&self, path: &Path) -> Result<()>;
     async fn create_symlink(&self, path: &Path, target: PathBuf) -> Result<()>;
     async fn create_file(&self, path: &Path, options: CreateOptions) -> Result<()>;
+    /// Creates and writes through a new file handle, failing if the path exists.
+    async fn create_file_exclusive(&self, path: &Path, content: &[u8]) -> Result<()>;
     async fn create_file_with(
         &self,
         path: &Path,
@@ -738,6 +740,18 @@ fn read_dir_entries(path: PathBuf) -> Result<impl Send + Iterator<Item = Result<
 
 #[async_trait::async_trait]
 impl Fs for RealFs {
+    async fn create_file_exclusive(&self, path: &Path, content: &[u8]) -> Result<()> {
+        let mut file = smol::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .await?;
+        file.write_all(content).await?;
+        // AsyncWrite can return before the background writer reaches the file.
+        // Callers must be able to read the complete contents and stable metadata.
+        file.flush().await?;
+        Ok(())
+    }
     async fn create_dir(&self, path: &Path) -> Result<()> {
         Ok(smol::fs::create_dir_all(path).await?)
     }
@@ -2979,6 +2993,27 @@ impl FileHandle for FakeHandle {
 #[cfg(feature = "test-support")]
 #[async_trait::async_trait]
 impl Fs for FakeFs {
+    async fn create_file_exclusive(&self, path: &Path, content: &[u8]) -> Result<()> {
+        self.simulate_random_delay().await;
+        let mut state = self.state.lock();
+        let inode = state.get_and_increment_inode();
+        let mtime = state.get_and_increment_mtime();
+        state.write_path(path, |entry| match entry {
+            btree_map::Entry::Occupied(_) => anyhow::bail!("path already exists: {path:?}"),
+            btree_map::Entry::Vacant(entry) => {
+                entry.insert(FakeFsEntry::File {
+                    inode,
+                    mtime,
+                    len: content.len() as u64,
+                    content: content.to_vec(),
+                    git_dir_path: None,
+                });
+                Ok(())
+            }
+        })?;
+        state.emit_event([(path, Some(PathEventKind::Created))]);
+        Ok(())
+    }
     async fn create_dir(&self, path: &Path) -> Result<()> {
         self.simulate_random_delay().await;
 

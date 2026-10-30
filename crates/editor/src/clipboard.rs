@@ -261,6 +261,16 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.paste_item_with_image_name(item, None, window, cx);
+    }
+
+    pub(super) fn paste_item_with_image_name(
+        &mut self,
+        item: &ClipboardItem,
+        image_name: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.read_only(cx) {
             return;
         }
@@ -282,35 +292,164 @@ impl Editor {
             };
 
             if is_markdown {
+                if image_name.is_none()
+                    && self.buffer.read(cx).as_singleton().is_some_and(|buffer| {
+                        buffer.read(cx).file().is_some_and(|file| {
+                            file.as_local().is_some() && file.path().parent().is_some()
+                        })
+                    })
+                {
+                    let providers: Vec<_> = cx
+                        .try_global::<extension::editor_commands::EditorCommands>()
+                        .map(|registry| {
+                            registry
+                                .1
+                                .iter()
+                                .filter_map(|(extension, commands)| {
+                                    commands.get("paste-markdown-image").map(|definition| {
+                                        (extension.to_string(), definition.clone())
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let [(extension, definition)] = providers.as_slice() {
+                        let mut arguments = definition.arguments.clone();
+                        if let Some(buffer) = self.buffer.read(cx).as_singleton()
+                            && let Some(file) = buffer.read(cx).file()
+                        {
+                            use settings::Settings as _;
+                            let location = settings::SettingsLocation {
+                                worktree_id: file.worktree_id(cx),
+                                path: file.path().as_ref(),
+                            };
+                            if let Some(template) =
+                                &project::project_settings::ProjectSettings::get(Some(location), cx)
+                                    .markdown_image_filename_template
+                            {
+                                if !arguments.is_object() {
+                                    arguments = serde_json::json!({});
+                                }
+                                arguments["template"] = template.clone().into();
+                            }
+                        }
+                        self.run_extension_command_with_context(
+                            extension,
+                            "paste-markdown-image",
+                            arguments,
+                            definition.context.clone(),
+                            window,
+                            cx,
+                        );
+                        return;
+                    }
+                }
                 let handled = maybe!({
                     let buffer = self.buffer().read(cx).as_singleton()?;
                     let file = buffer.read(cx).file()?;
                     let worktree_id = file.worktree_id(cx);
                     let dir_rel_path = file.path().parent()?.into_arc();
+                    let document_stem = file.path().file_stem()?;
                     let worktree = self
                         .project
                         .as_ref()?
                         .read(cx)
                         .worktree_for_id(worktree_id, cx)?;
 
-                    let extension = image.format.extension();
+                    // Keep the fallback consistent with the extension's default local time.
+                    let (base, extension) = if let Some(name) = image_name {
+                        let path = Path::new(name);
+                        (
+                            path.file_stem()?.to_str()?.to_owned(),
+                            path.extension()?.to_str()?.to_owned(),
+                        )
+                    } else {
+                        (
+                            format!(
+                                "{document_stem}.{}",
+                                chrono::Local::now().format("%y%m%d%H%M%S")
+                            ),
+                            image.format.extension().to_owned(),
+                        )
+                    };
                     let snapshot = worktree.read(cx).snapshot();
-                    let (filename, file_path) =
-                        unused_image_path(&dir_rel_path, extension, |path| {
+                    let (filename, _) =
+                        unused_image_path(&dir_rel_path, &base, &extension, |path| {
                             snapshot.entry_for_path(path).is_some()
                         })?;
-
-                    let create_task = worktree.update(cx, |worktree, cx| {
-                        worktree.create_entry(file_path, false, Some(image.bytes.clone()), cx)
+                    let directory = file.as_local()?.abs_path(cx).parent()?.to_path_buf();
+                    let fs = self.project.as_ref()?.read(cx).fs().clone();
+                    let bytes = image.bytes.clone();
+                    let version = buffer.read(cx).version();
+                    let source_selections = self.selections.disjoint_anchors_arc();
+                    let task = cx.spawn_in(window, async move |editor, cx| {
+                        let mut filename = filename;
+                        let mut path = directory.join(&filename);
+                        let mut counter = 0;
+                        loop {
+                            match fs.create_file_exclusive(&path, &bytes).await {
+                                Ok(()) => break,
+                                Err(error) => {
+                                    if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                                        error.kind() != std::io::ErrorKind::AlreadyExists
+                                    }) || fs.metadata(&path).await?.is_none()
+                                        || counter >= 10_000
+                                    {
+                                        return Err(error);
+                                    }
+                                    counter += 1;
+                                    filename = format!("{base}_{counter}.{extension}");
+                                    path = directory.join(&filename);
+                                }
+                            }
+                        }
+                        let identity = fs
+                            .metadata(&path)
+                            .await?
+                            .context("Pasted image disappeared")?;
+                        let result = editor
+                            .update_in(cx, |editor, window, cx| {
+                                anyhow::ensure!(
+                                    !editor.read_only(cx)
+                                        && editor.buffer.read(cx).as_singleton().as_ref()
+                                            == Some(&buffer)
+                                        && buffer.read(cx).version() == version
+                                        && editor.selections.disjoint_anchors_arc()
+                                            == source_selections,
+                                    "Document or selection changed while saving the pasted image"
+                                );
+                                editor.finalize_last_transaction(cx);
+                                let mut result = Ok(());
+                                let transaction =
+                                    editor.transact(window, cx, |editor, window, cx| {
+                                        result = editor.insert_image_snippet(&filename, window, cx);
+                                    });
+                                result?;
+                                editor.finalize_last_transaction(cx);
+                                super::image_paste::track(
+                                    &buffer,
+                                    transaction.context("Missing image paste transaction")?,
+                                    fs.clone(),
+                                    path.clone(),
+                                    bytes.clone(),
+                                    identity,
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .and_then(|result| result);
+                        if result.is_err()
+                            && let Some(current) = fs.metadata(&path).await?
+                            && !current.is_symlink
+                            && current.inode == identity.inode
+                            && current.mtime == identity.mtime
+                            && fs.load_bytes(&path).await? == bytes
+                        {
+                            fs.remove_file(&path, fs::RemoveOptions::default()).await?;
+                        }
+                        result
                     });
-
-                    cx.spawn_in(window, async move |editor, cx| {
-                        create_task.await?;
-                        editor.update_in(cx, |editor, window, cx| {
-                            editor.insert_image_snippet(&filename, window, cx)
-                        })
-                    })
-                    .detach_and_log_err(cx);
+                    self.detach_and_notify_err(task, window, cx);
 
                     Some(())
                 });
@@ -342,10 +481,9 @@ impl Editor {
         filename: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let Some(snippet) = Snippet::parse(&format!("![$1]({filename})$0")).log_err() else {
-            return;
-        };
+    ) -> Result<()> {
+        let destination = markdown_link_destination(filename);
+        let snippet = Snippet::parse(&format!("![$1]({destination})$0"))?;
         let display_map = self.display_snapshot(cx);
         let insertion_ranges: Vec<Range<MultiBufferOffset>> = self
             .selections
@@ -354,7 +492,6 @@ impl Editor {
             .map(|selection| selection.start..selection.end)
             .collect();
         self.insert_snippet(&insertion_ranges, snippet, window, cx)
-            .log_err();
     }
 
     pub(super) fn cut_common(
@@ -730,24 +867,42 @@ fn edit_for_markdown_paste<'a>(
     (range, new_text)
 }
 
-/// Returns a filename of the form `image.{extension}` (or `image_{N}.{extension}`
+/// Returns a filename of the form `{base}.{extension}` (or `{base}_{N}.{extension}`
 /// if taken) that does not collide with an existing entry in `dir_rel_path`,
 /// along with the full path of the candidate file.
 fn unused_image_path(
     dir_rel_path: &RelPath,
+    base: &str,
     extension: &str,
     exists: impl Fn(&RelPath) -> bool,
 ) -> Option<(String, Arc<RelPath>)> {
-    let mut filename = format!("image.{extension}");
+    let mut filename = format!("{base}.{extension}");
     let mut counter = 1u32;
     loop {
         let candidate = dir_rel_path.join(RelPath::from_unix_str(&filename).ok()?);
         if !exists(&candidate) {
             return Some((filename, candidate.into()));
         }
-        filename = format!("image_{counter}.{extension}");
+        filename = format!("{base}_{counter}.{extension}");
         counter += 1;
     }
+}
+
+/// Formats `filename` as a CommonMark link destination by percent-encoding every
+/// UTF-8 byte outside the URL unreserved set (ASCII alphanumerics and `-._~`).
+/// Wrapping in `<...>` instead would still leave `#` read as a fragment, `%` as
+/// an existing escape and newlines unrepresentable, and the result is also free
+/// of the `$`, `}` and `\` that LSP snippet syntax treats specially.
+fn markdown_link_destination(filename: &str) -> String {
+    let mut destination = String::with_capacity(filename.len());
+    for byte in filename.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            destination.push(byte as char);
+        } else {
+            destination.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    destination
 }
 
 /// Whether `text` consists solely of a single URL, as opposed to merely
@@ -760,4 +915,87 @@ fn is_standalone_url(text: &str) -> bool {
         .links(text)
         .next()
         .is_some_and(|link| link.start() == 0 && link.end() == text.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unused_image_path_appends_counter_on_collision() {
+        let dir = RelPath::from_unix_str("docs").unwrap();
+        let taken = ["docs/note.260914012345.png", "docs/note.260914012345_1.png"];
+        let exists = |path: &RelPath| taken.contains(&path.as_unix_str());
+
+        let (filename, path) =
+            unused_image_path(dir, "note.260914012345", "png", |_| false).unwrap();
+        assert_eq!(filename, "note.260914012345.png");
+        assert_eq!(path.as_unix_str(), "docs/note.260914012345.png");
+
+        let (filename, path) = unused_image_path(dir, "note.260914012345", "png", exists).unwrap();
+        assert_eq!(filename, "note.260914012345_2.png");
+        assert_eq!(path.as_unix_str(), "docs/note.260914012345_2.png");
+
+        // The taken names live under `docs/`, so the same base is free at the root.
+        let (filename, path) =
+            unused_image_path(RelPath::empty(), "note.260914012345", "png", exists).unwrap();
+        assert_eq!(filename, "note.260914012345.png");
+        assert_eq!(path.as_unix_str(), "note.260914012345.png");
+    }
+
+    #[test]
+    fn test_markdown_link_destination_percent_encodes_reserved_bytes() {
+        for (filename, expected) in [
+            ("note.260914012345.png", "note.260914012345.png"),
+            (
+                "my-note_v2~.260914012345.png",
+                "my-note_v2~.260914012345.png",
+            ),
+            (
+                "メモ.260914012345.png",
+                "%E3%83%A1%E3%83%A2.260914012345.png",
+            ),
+            ("my note.260914012345.png", "my%20note.260914012345.png"),
+            (
+                "note (1).260914012345.png",
+                "note%20%281%29.260914012345.png",
+            ),
+            ("$note.260914012345.png", "%24note.260914012345.png"),
+            ("note#1.260914012345.png", "note%231.260914012345.png"),
+            ("100%.260914012345.png", "100%25.260914012345.png"),
+            ("a\nb.260914012345.png", "a%0Ab.260914012345.png"),
+            ("a\\b.260914012345.png", "a%5Cb.260914012345.png"),
+            (
+                "${a}<b>.260914012345.png",
+                "%24%7Ba%7D%3Cb%3E.260914012345.png",
+            ),
+        ] {
+            assert_eq!(markdown_link_destination(filename), expected);
+        }
+    }
+
+    #[test]
+    fn test_markdown_link_destination_survives_snippet_parse() {
+        for filename in [
+            "note.260914012345.png",
+            "メモ.260914012345.png",
+            "my note.260914012345.png",
+            "note (1).260914012345.png",
+            "$note.260914012345.png",
+            "note#1.260914012345.png",
+            "100%.260914012345.png",
+            "a\nb.260914012345.png",
+            "a\\b.260914012345.png",
+            "${a}<b>.260914012345.png",
+        ] {
+            let destination = markdown_link_destination(filename);
+            let source = format!("![$1]({destination})$0");
+            let snippet = Snippet::parse(&source).unwrap();
+            assert_eq!(
+                snippet.text,
+                format!("![]({destination})"),
+                "source: {source:?}"
+            );
+        }
+    }
 }

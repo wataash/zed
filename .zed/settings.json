@@ -48,8 +48,13 @@
   "lsp": {
     "rust-analyzer": {
       "initialization_options": {
+        "checkOnSave": false,
+        "numThreads": 2,
+        "cachePriming": {
+          "numThreads": 2,
+        },
         "procMacro": {
-          "processes": 4,
+          "processes": 2,
         },
       },
     },

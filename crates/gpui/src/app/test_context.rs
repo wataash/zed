@@ -135,6 +135,7 @@ impl TestAppContext {
             background_executor,
             foreground_executor,
             platform,
+            Arc::new(()),
         )
     }
 
@@ -158,6 +159,34 @@ impl TestAppContext {
             background_executor,
             foreground_executor,
             platform,
+            Arc::new(()),
+        )
+    }
+
+    /// Creates a deterministic test context with real text shaping and GPU capture.
+    pub fn build_with_rendering(
+        dispatcher: TestDispatcher,
+        platform_text_system: Arc<dyn PlatformTextSystem>,
+        assets: Arc<dyn crate::AssetSource>,
+        renderer_factory: impl Fn() -> Result<Option<Box<dyn crate::PlatformHeadlessRenderer>>>
+        + 'static,
+    ) -> Self {
+        let arc_dispatcher = Arc::new(dispatcher.clone());
+        let background_executor = BackgroundExecutor::new(arc_dispatcher.clone());
+        let foreground_executor = ForegroundExecutor::new(arc_dispatcher);
+        let platform = TestPlatform::with_platform(
+            background_executor.clone(),
+            foreground_executor.clone(),
+            platform_text_system,
+            Some(Box::new(renderer_factory)),
+        );
+        Self::build_with_platform(
+            dispatcher,
+            None,
+            background_executor,
+            foreground_executor,
+            platform,
+            assets,
         )
     }
 
@@ -167,8 +196,8 @@ impl TestAppContext {
         background_executor: BackgroundExecutor,
         foreground_executor: ForegroundExecutor,
         platform: Rc<TestPlatform>,
+        asset_source: Arc<dyn crate::AssetSource>,
     ) -> Self {
-        let asset_source = Arc::new(());
         let http_client = http_client::FakeHttpClient::with_404_response();
         let text_system = Arc::new(TextSystem::new(platform.text_system()));
 

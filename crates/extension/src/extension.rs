@@ -1,4 +1,5 @@
 mod capabilities;
+pub mod editor_commands;
 pub mod extension_builder;
 mod extension_events;
 mod extension_host_proxy;
@@ -59,6 +60,10 @@ pub trait Extension: Send + Sync + 'static {
     /// Returns a path relative to this extension's working directory.
     fn path_from_extension(&self, path: &Path) -> PathBuf {
         normalize_path(&self.work_dir().join(path))
+    }
+
+    async fn run_editor_command(&self, _command: String, _input: String) -> Result<String> {
+        bail!("This extension does not provide editing commands")
     }
 
     async fn language_server_command(

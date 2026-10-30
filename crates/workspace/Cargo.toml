@@ -13,6 +13,7 @@ path = "src/workspace.rs"
 doctest = false
 
 [features]
+visual-test-capture = ["test-support", "dep:gpui_wgpu", "dep:assets"]
 test-support = [
     "client/test-support",
     "http_client/test-support",
@@ -26,6 +27,8 @@ test-support = [
 ]
 
 [dependencies]
+assets = { workspace = true, optional = true }
+gpui_wgpu = { workspace = true, features = ["test-support", "font-kit"], optional = true }
 any_vec.workspace = true
 agent_settings.workspace = true
 anyhow.workspace = true

@@ -1,6 +1,7 @@
 mod worktree_settings_tests;
 
 use anyhow::Result;
+use collections::HashSet;
 use encoding_rs;
 use fs::{FakeFs, Fs, PathEventKind, RealFs, RemoveOptions};
 use git::{DOT_GIT, GITIGNORE, REPO_EXCLUDE};
@@ -1731,6 +1732,189 @@ async fn test_new_directory_scan_does_not_miss_event_before_adding_watcher(
             ]
         );
     });
+}
+
+#[cfg(target_os = "linux")]
+#[gpui::test]
+async fn test_zhack_watch_exclusions_keep_entries_and_reconfigure(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    let recording = fs
+        .record_watcher_diagnostics()
+        .expect("fake watcher diagnostics");
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".git": {"HEAD": "ref: refs/heads/main\n", "objects": {"ab": {"object": ""}}, "refs": {"heads": {"main": "", "topic": {"new": "commit"}}}},
+            "src": {"main.rs": ""}
+        }),
+    )
+    .await;
+    fs.create_symlink(Path::new("/root/alias"), PathBuf::from(".git/objects"))
+        .await
+        .expect("internal symlink");
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions = Some(SplicingVec::from(vec![]));
+                settings.project.worktree.file_scan_inclusions =
+                    Some(SplicingVec::from(vec!["**/.git/**".to_string()]));
+                settings.project.worktree.scan_symlinks =
+                    Some(settings::ScanSymlinksSetting::Always);
+                settings
+                    .project
+                    .zhack
+                    .get_or_insert_default()
+                    .watch_exclusions = Some(SplicingVec::from(vec!["**/.git".to_string()]));
+            });
+        });
+    });
+    let tree = Worktree::local(
+        Path::new("/root"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .expect("worktree");
+    cx.read(|cx| {
+        tree.read(cx)
+            .as_local()
+            .expect("local worktree")
+            .scan_complete()
+    })
+    .await;
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            tree.entry_for_path(rel_path(".git/objects/ab/object"))
+                .is_some()
+        );
+    });
+    cx.run_until_parked();
+    let watched_paths = || {
+        recording
+            .snapshot()
+            .watchers
+            .into_iter()
+            .flat_map(|watcher| {
+                watcher
+                    .roots
+                    .into_iter()
+                    .map(|root| PathBuf::from(root.path))
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(watched_paths().contains(&PathBuf::from("/root/src")));
+    let git_paths = || {
+        watched_paths()
+            .into_iter()
+            .filter(|path| path.starts_with("/root/.git"))
+            .collect::<HashSet<_>>()
+    };
+    assert_eq!(
+        git_paths(),
+        HashSet::from_iter([
+            PathBuf::from("/root/.git"),
+            PathBuf::from("/root/.git/refs/heads"),
+        ])
+    );
+    assert!(
+        !fs.watch_calls()
+            .iter()
+            .any(|path| path.starts_with("/root/.git/objects"))
+    );
+    assert!(
+        !fs.watch_calls()
+            .iter()
+            .any(|path| path.starts_with("/root/alias"))
+    );
+
+    fs.atomic_write(
+        PathBuf::from("/root/.git/HEAD"),
+        "ref: refs/heads/topic/new\n".into(),
+    )
+    .await
+    .expect("switch branch");
+    cx.run_until_parked();
+    assert_eq!(
+        git_paths(),
+        HashSet::from_iter([
+            PathBuf::from("/root/.git"),
+            PathBuf::from("/root/.git/refs/heads/topic"),
+        ])
+    );
+    let updates = Rc::new(Cell::new(0));
+    let subscription = cx.update({
+        let updates = updates.clone();
+        |cx| {
+            cx.subscribe(&tree, move |_, event, _| {
+                if matches!(event, Event::UpdatedGitRepositories(_)) {
+                    updates.set(updates.get() + 1);
+                }
+            })
+        }
+    });
+    fs.atomic_write(
+        PathBuf::from("/root/.git/refs/heads/topic/new"),
+        "new commit".into(),
+    )
+    .await
+    .expect("commit");
+    cx.run_until_parked();
+    assert!(
+        updates.get() > 0,
+        "current ref changes must refresh Git state"
+    );
+    drop(subscription);
+    fs.atomic_write(
+        PathBuf::from("/root/.git/HEAD"),
+        "ref: refs/heads/main\n".into(),
+    )
+    .await
+    .expect("switch back");
+    cx.run_until_parked();
+
+    for exclude in [false, true] {
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .project
+                        .zhack
+                        .get_or_insert_default()
+                        .watch_exclusions = Some(SplicingVec::from(if exclude {
+                        vec!["**/.git".to_string()]
+                    } else {
+                        vec![]
+                    }));
+                });
+            });
+        });
+        cx.executor().run_until_parked();
+        cx.read(|cx| {
+            tree.read(cx)
+                .as_local()
+                .expect("local worktree")
+                .scan_complete()
+        })
+        .await;
+        let watched = watched_paths();
+        assert_eq!(
+            watched.contains(&PathBuf::from("/root/.git/objects/ab")),
+            !exclude
+        );
+        assert!(watched.contains(&PathBuf::from("/root/.git/refs/heads")));
+        assert!(watched.contains(&PathBuf::from("/root/src")));
+        tree.read_with(cx, |tree, _| {
+            assert!(
+                tree.entry_for_path(rel_path(".git/objects/ab/object"))
+                    .is_some()
+            );
+        });
+    }
 }
 
 #[gpui::test]

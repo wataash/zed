@@ -44,6 +44,7 @@ pub struct SearchInputs {
     files_to_exclude: PathMatcher,
     match_full_paths: bool,
     buffers: Option<Vec<Entity<Buffer>>>,
+    excluded_worktrees: Vec<crate::WorktreeId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +137,7 @@ impl SearchQuery {
             .ascii_case_insensitive(!case_sensitive)
             .build([&query])?;
         let inner = SearchInputs {
+            excluded_worktrees: Vec::new(),
             query: query.into(),
             files_to_exclude,
             files_to_include,
@@ -170,6 +172,7 @@ impl SearchQuery {
     ) -> Result<Self> {
         let query = query.to_string();
         let inner = SearchInputs {
+            excluded_worktrees: Vec::new(),
             query: Arc::from(query.as_str()),
             files_to_include,
             files_to_exclude,
@@ -205,6 +208,7 @@ impl SearchQuery {
         let mut query = query.to_string();
         text::LineEnding::normalize(&mut query);
         let inner = SearchInputs {
+            excluded_worktrees: Vec::new(),
             query: Arc::from(query.as_str()),
             files_to_include,
             files_to_exclude,
@@ -652,6 +656,19 @@ impl SearchQuery {
             }
         }
     }
+    /// A local UI scope, independent of user-entered path filters.
+    pub fn exclude_worktrees(&mut self, worktrees: Vec<crate::WorktreeId>) {
+        match self {
+            Self::Regex { inner, .. } | Self::Text { inner, .. } => {
+                inner.excluded_worktrees = worktrees
+            }
+        }
+    }
+
+    pub fn includes_worktree(&self, id: crate::WorktreeId) -> bool {
+        !self.as_inner().excluded_worktrees.contains(&id)
+    }
+
     pub fn as_inner(&self) -> &SearchInputs {
         match self {
             Self::Regex { inner, .. } | Self::Text { inner, .. } => inner,

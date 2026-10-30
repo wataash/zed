@@ -1146,6 +1146,7 @@ impl Editor {
             None
         };
 
+        let workspace = self.workspace();
         let url_finder = cx.spawn_in(window, async move |_editor, cx| {
             let url = if let Some(end_pos) = end_position {
                 find_url_from_range(&buffer, start_position..end_pos, cx)
@@ -1161,7 +1162,7 @@ impl Editor {
                             cx,
                         );
                     } else {
-                        cx.open_url(&url);
+                        hover_popover::open_markdown_url(workspace, url.into(), window, cx);
                     }
                 })?;
             }
@@ -1196,6 +1197,11 @@ impl Editor {
             let result = find_file(&buffer, project, buffer_position, cx).await;
 
             if let Some((_, file_target)) = result {
+                if workspace.update_in(cx, |workspace, _, cx| {
+                    workspace.open_video_link_with_system(&file_target.resolved_path, cx)
+                })? {
+                    return anyhow::Ok(());
+                }
                 let item = workspace
                     .update_in(cx, |workspace, window, cx| {
                         workspace.open_resolved_path(file_target.resolved_path.clone(), window, cx)
@@ -1862,7 +1868,7 @@ impl Editor {
                                     cx,
                                 );
                             } else {
-                                cx.open_url(&url);
+                                hover_popover::open_markdown_url(workspace, url.into(), window, cx);
                             }
                         })?;
                         Ok(Navigated::Yes)
@@ -1874,6 +1880,11 @@ impl Editor {
                         let Some(workspace) = workspace else {
                             return Ok(Navigated::No);
                         };
+                        if workspace.update_in(cx, |workspace, _, cx| {
+                            workspace.open_video_link_with_system(&file_target.resolved_path, cx)
+                        })? {
+                            return Ok(Navigated::Yes);
+                        }
                         let item = workspace
                             .update_in(cx, |workspace, window, cx| {
                                 workspace.open_resolved_path(

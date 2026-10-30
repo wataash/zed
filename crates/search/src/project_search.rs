@@ -31,6 +31,8 @@ use itertools::Itertools;
 use language::{Buffer, Language};
 use menu::Confirm;
 use multi_buffer;
+use open_path_prompt::file_finder_settings::FileFinderSettings;
+use project::search_scope::SearchScope;
 use project::{
     Project, ProjectPath, SearchResults,
     search::{SearchInputKind, SearchQuery, SearchResult},
@@ -54,7 +56,10 @@ use ui::{
     CommonAnimationExt, IconButtonShape, KeyBinding, Toggleable, Tooltip, prelude::*,
     utils::SearchInputWidth,
 };
-use util::{ResultExt as _, paths::PathMatcher};
+use util::{
+    ResultExt as _,
+    paths::{PathMatcher, PathStyle},
+};
 use workspace::{
     DeploySearch, ItemNavHistory, NewSearch, ToolbarItemEvent, ToolbarItemLocation,
     ToolbarItemView, Workspace, WorkspaceId,
@@ -281,6 +286,7 @@ enum SearchMode {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SearchSignature {
+    expanded_scope: bool,
     query: String,
     included_files: String,
     excluded_files: String,
@@ -360,6 +366,7 @@ enum InputPanel {
 }
 
 pub struct ProjectSearchView {
+    search_scope: SearchScope,
     pub(crate) workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     pub(crate) entity: Entity<ProjectSearch>,
@@ -606,6 +613,7 @@ impl ProjectSearch {
         let Some(query) = self.active_query.clone() else {
             return;
         };
+        let file_finder_exclusions = file_finder_exclusion_globs(cx);
         self.project.update(cx, |project, _| {
             project
                 .search_history_mut(SearchInputKind::Query)
@@ -616,7 +624,12 @@ impl ProjectSearch {
                     .search_history_mut(SearchInputKind::Include)
                     .add(&mut self.search_included_history_cursor, included);
             }
-            let excluded = query.as_inner().files_to_exclude().sources().join(",");
+            let excluded = query
+                .as_inner()
+                .files_to_exclude()
+                .sources()
+                .filter(|source| !file_finder_exclusions.iter().any(|glob| glob == source))
+                .join(",");
             if !excluded.is_empty() {
                 project
                     .search_history_mut(SearchInputKind::Exclude)
@@ -1285,6 +1298,45 @@ impl Item for ProjectSearchView {
     }
 }
 
+/// `zhack.search.exclusions` expanded to also match files below excluded directories,
+/// and paths prefixed with a worktree root name (used when several worktrees are open).
+fn file_finder_exclusion_globs(cx: &App) -> Vec<String> {
+    FileFinderSettings::get_global(cx)
+        .exclusions
+        .sources()
+        .flat_map(|glob| {
+            let glob = glob.trim_end_matches('/');
+            [
+                glob.to_string(),
+                format!("{glob}/**"),
+                format!("*/{glob}"),
+                format!("*/{glob}/**"),
+            ]
+        })
+        .collect()
+}
+
+/// Excludes `zhack.search.exclusions`, so project search covers the same files as the file finder.
+fn with_file_finder_exclusions(
+    excluded: PathMatcher,
+    path_style: PathStyle,
+    cx: &App,
+) -> PathMatcher {
+    let file_finder_exclusions = file_finder_exclusion_globs(cx);
+    if file_finder_exclusions.is_empty() {
+        return excluded;
+    }
+    let globs = excluded
+        .sources()
+        .map(str::to_string)
+        .chain(file_finder_exclusions)
+        .collect::<Vec<_>>();
+    PathMatcher::new(&globs, path_style)
+        .context("Failed to combine zhack.search.exclusions with search exclusions")
+        .log_err()
+        .unwrap_or(excluded)
+}
+
 impl ProjectSearchView {
     pub fn get_matches(&self, cx: &App) -> Vec<Range<Anchor>> {
         self.entity.read(cx).match_ranges.clone()
@@ -1638,8 +1690,10 @@ impl ProjectSearchView {
         })
         .detach_and_log_err(cx);
 
+        let search_scope = SearchScope::new(entity.read(cx).project.read(cx), cx);
         // Check if Worktrees have all been previously indexed
         let mut this = ProjectSearchView {
+            search_scope,
             workspace,
             focus_handle,
             replacement_editor,
@@ -1663,8 +1717,30 @@ impl ProjectSearchView {
             _subscriptions: subscriptions,
         };
 
+        this.prepare_additional_roots(cx);
         this.entity_changed(window, cx);
         this
+    }
+
+    fn prepare_additional_roots(&mut self, cx: &mut Context<Self>) {
+        if !self.search_scope.is_configured() {
+            return;
+        }
+        let project = self.entity.read(cx).project.clone();
+        let prepare = project.update(cx, |project, cx| self.search_scope.prepare(project, cx));
+        cx.spawn(async move |this, cx| {
+            let result = prepare.await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.workspace
+                        .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                        .log_err();
+                } else if this.entity.read(cx).active_query.is_some() && !this.is_dirty(cx) {
+                    this.search(SearchMode::OnType, cx);
+                }
+            })
+        })
+        .detach_and_log_err(cx);
     }
 
     pub fn new_search_with_filter(
@@ -1702,6 +1778,20 @@ impl ProjectSearchView {
             .items()
             .find_map(|item| item.downcast::<ProjectSearchView>());
 
+        if workspace.active_item_as::<Self>(cx).is_none() {
+            if let Some(search) = &existing {
+                search.update(cx, |search, cx| {
+                    let scope = SearchScope::new(search.entity.read(cx).project.read(cx), cx);
+                    if scope.is_configured() || search.search_scope.is_configured() {
+                        search.search_scope = scope;
+                        search.prepare_additional_roots(cx);
+                        if search.entity.read(cx).active_query.is_some() && !search.is_dirty(cx) {
+                            search.search(SearchMode::OnType, cx);
+                        }
+                    }
+                });
+            }
+        }
         Self::existing_or_new_search(workspace, existing, action, window, cx);
     }
 
@@ -2018,6 +2108,7 @@ impl ProjectSearchView {
         cx: &App,
     ) -> SearchSignature {
         SearchSignature {
+            expanded_scope: self.search_scope.expanded,
             query: self.search_query_text(cx),
             included_files: self
                 .filters_enabled
@@ -2132,6 +2223,8 @@ impl ProjectSearchView {
             .count()
             > 1;
 
+        let path_style = self.entity.read(cx).project.read(cx).path_style(cx);
+        let excluded_files = with_file_finder_exclusions(excluded_files, path_style, cx);
         let query = match self.search_options.build_query(
             text,
             included_files,
@@ -2139,7 +2232,11 @@ impl ProjectSearchView {
             match_full_paths,
             open_buffers,
         ) {
-            Ok(query) => {
+            Ok(mut query) => {
+                query.exclude_worktrees(
+                    self.search_scope
+                        .excluded_worktrees(self.entity.read(cx).project.read(cx), cx),
+                );
                 let should_unmark_error = self.panels_with_errors.remove(&InputPanel::Query);
                 if should_unmark_error.is_some() {
                     cx.notify();
@@ -2183,8 +2280,12 @@ impl ProjectSearchView {
     /// to a default (match-all) matcher. Shared with the text finder, which is
     /// backed by the same view.
     pub(crate) fn file_path_filters(&self, cx: &App) -> (PathMatcher, PathMatcher) {
+        let path_style = self.entity.read(cx).project.read(cx).path_style(cx);
         if !self.filters_enabled {
-            return (PathMatcher::default(), PathMatcher::default());
+            return (
+                PathMatcher::default(),
+                with_file_finder_exclusions(PathMatcher::default(), path_style, cx),
+            );
         }
         let included = self
             .parse_path_matches(self.included_files_editor.read(cx).text(cx), cx)
@@ -2192,7 +2293,10 @@ impl ProjectSearchView {
         let excluded = self
             .parse_path_matches(self.excluded_files_editor.read(cx).text(cx), cx)
             .unwrap_or_default();
-        (included, excluded)
+        (
+            included,
+            with_file_finder_exclusions(excluded, path_style, cx),
+        )
     }
 
     fn parse_path_matches(&self, text: String, cx: &App) -> anyhow::Result<PathMatcher> {
@@ -2665,7 +2769,21 @@ impl ProjectSearchBar {
     fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(search_view) = self.active_project_search.as_ref() {
             search_view.update(cx, |search_view, cx| {
-                search_view.focus_query_editor(window, cx);
+                if search_view.query_editor.focus_handle(cx).is_focused(window)
+                    && search_view.search_scope.is_configured()
+                {
+                    search_view.search_scope.expanded = !search_view.search_scope.expanded;
+                    if search_view.is_dirty(cx) {
+                        search_view
+                            .prompt_to_save_if_dirty_then_search(window, cx)
+                            .detach_and_log_err(cx);
+                    } else {
+                        search_view.search(SearchMode::OnType, cx);
+                    }
+                    cx.notify();
+                } else {
+                    search_view.focus_query_editor(window, cx);
+                }
             });
         }
     }
@@ -3334,7 +3452,20 @@ impl Render for ProjectSearchBar {
         v_flex()
             .gap_2()
             .w_full()
+            .when(search.search_scope.is_configured(), |element| {
+                element.child(
+                    Label::new(
+                        search
+                            .search_scope
+                            .label(search.entity.read(cx).project.read(cx), cx),
+                    )
+                    .size(LabelSize::Small),
+                )
+            })
             .key_context(key_context)
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                this.focus_search(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleFocus, window, cx| {
                 this.move_focus_to_results(window, cx)
             }))
@@ -3718,6 +3849,78 @@ pub mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[gpui::test]
+    async fn test_zhack_search_exclusions_apply_to_project_search(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                ".git": {},
+                ".gitignore": "target\n",
+                "a.txt": "hello",
+                "target": { "b.txt": "hello" },
+                "vendor": { "c.txt": "hello" },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let search = cx.new(|cx| ProjectSearch::new(project.clone(), workspace.downgrade(), cx));
+        let search_view = cx.add_window(|window, cx| {
+            ProjectSearchView::new(workspace.downgrade(), search, window, cx, None)
+        });
+        search_view
+            .update(cx, |search_view, _, cx| {
+                search_view.toggle_search_option(SearchOptions::INCLUDE_IGNORED, cx);
+            })
+            .unwrap();
+        let match_count = |cx: &mut TestAppContext| {
+            search_view
+                .update(cx, |search_view, _, cx| {
+                    search_view.entity.read(cx).match_ranges.len()
+                })
+                .unwrap()
+        };
+
+        perform_search(search_view, "hello", cx);
+        assert_eq!(match_count(cx), 3);
+
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .project
+                        .zhack
+                        .get_or_insert_default()
+                        .search
+                        .get_or_insert_default()
+                        .exclusions = Some(settings::SplicingVec::from(vec![
+                        "**/target".to_string(),
+                        "vendor".to_string(),
+                    ]));
+                });
+            });
+        });
+        perform_search(search_view, "hello", cx);
+        assert_eq!(
+            match_count(cx),
+            1,
+            "Files below zhack.search.exclusions are not searched"
+        );
+        project.update(cx, |project, _| {
+            assert_eq!(
+                project.search_history(SearchInputKind::Exclude).len(),
+                0,
+                "zhack.search.exclusions are not recorded as typed exclusions"
+            );
+        });
     }
 
     #[perf]
@@ -6843,6 +7046,141 @@ pub mod tests {
             let query_text = search_view.query_editor.read(cx).text(cx);
             assert_eq!(query_text, "Uppercase_Query");
         });
+    }
+
+    #[gpui::test]
+    async fn test_additional_search_roots_toggle(cx: &mut TestAppContext) {
+        #[cfg(feature = "visual-test-capture")]
+        workspace::visual_test_capture::initialize(cx).expect("capture renderer");
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/notes", json!({"memo.txt": "needle"}))
+            .await;
+        fs.insert_tree(
+            "/archive",
+            json!({"old.txt": "needle", "target": {"hidden.txt": "needle"}}),
+        )
+        .await;
+        fs.insert_tree("/other", json!({"other.txt": "needle"}))
+            .await;
+        let project = Project::test(fs, ["/notes".as_ref()], cx).await;
+        // A previously opened archive file may belong to an invisible worktree.
+        let _archive_buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer("/archive/old.txt", cx)
+            })
+            .await
+            .expect("archive buffer");
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    let search = settings
+                        .project
+                        .zhack
+                        .get_or_insert_default()
+                        .search
+                        .get_or_insert_default();
+                    search.additional_roots = Some(vec!["/archive".into(), "/other".into()]);
+                    search.exclusions = Some(SplicingVec::from(vec!["**/target".into()]));
+                });
+            })
+        });
+        let (window, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window.read_with(cx, |mw, _| mw.workspace().clone());
+        workspace.update_in(cx, |workspace, window, cx| {
+            let bar = cx.new(|_| ProjectSearchBar::new());
+            workspace.active_pane().update(cx, |pane, cx| {
+                pane.toolbar()
+                    .update(cx, |toolbar, cx| toolbar.add_item(bar, window, cx));
+            });
+        });
+        cx.update(|_, cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new(
+                    "ctrl-shift-f",
+                    workspace::DeploySearch::default(),
+                    Some("Workspace"),
+                ),
+                gpui::KeyBinding::new(
+                    "ctrl-shift-f",
+                    zed_actions::search::FocusSearch,
+                    Some("ProjectSearchBar"),
+                ),
+            ])
+        });
+        cx.simulate_keystrokes("ctrl-shift-f");
+        cx.run_until_parked();
+        let search = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item_as::<ProjectSearchView>(cx)
+                .expect("search view")
+        });
+        perform_project_search(&search, "needle", cx);
+        search.read_with(cx, |search, cx| {
+            assert!(!search.search_scope.expanded);
+            assert_eq!(search.entity.read(cx).match_ranges.len(), 1);
+        });
+        #[cfg(feature = "visual-test-capture")]
+        workspace::visual_test_capture::capture(cx, "project-search-normal")
+            .expect("normal scope capture");
+        search.update_in(cx, |search, window, cx| {
+            assert!(
+                search.search_scope.is_configured(),
+                "configured search scope"
+            );
+            search.focus_query_editor(window, cx);
+            assert!(
+                search.query_editor.focus_handle(cx).is_focused(window),
+                "focused search query"
+            );
+        });
+        cx.simulate_keystrokes("ctrl-shift-f");
+        cx.run_until_parked();
+        search.read_with(cx, |search, cx| {
+            assert!(search.search_scope.expanded);
+            assert_eq!(search.query_editor.read(cx).text(cx), "needle");
+            assert_eq!(search.entity.read(cx).match_ranges.len(), 3);
+        });
+        search.update_in(cx, |search, window, cx| {
+            assert!(search.query_editor.focus_handle(cx).is_focused(window));
+        });
+        #[cfg(feature = "visual-test-capture")]
+        workspace::visual_test_capture::capture(cx, "project-search-expanded")
+            .expect("expanded scope capture");
+        // Repeating the shortcut while the query is focused narrows the scope.
+        search.update_in(cx, |search, window, cx| {
+            search.focus_query_editor(window, cx)
+        });
+        cx.simulate_keystrokes("ctrl-shift-f");
+        cx.run_until_parked();
+        search.read_with(cx, |search, cx| {
+            assert!(!search.search_scope.expanded);
+            assert_eq!(search.entity.read(cx).match_ranges.len(), 1);
+        });
+        cx.simulate_keystrokes("ctrl-shift-f");
+        cx.run_until_parked();
+        search.read_with(cx, |search, _| assert!(search.search_scope.expanded));
+        cx.dispatch_action(workspace::CloseActiveItem {
+            save_intent: None,
+            close_pinned: false,
+        });
+        cx.simulate_keystrokes("ctrl-shift-f");
+        cx.run_until_parked();
+        let reopened = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item_as::<ProjectSearchView>(cx)
+                .expect("reopened search")
+        });
+        perform_project_search(&reopened, "needle", cx);
+        reopened.read_with(cx, |search, cx| {
+            assert!(!search.search_scope.expanded);
+            assert_eq!(search.entity.read(cx).match_ranges.len(), 1);
+        });
+        #[cfg(feature = "visual-test-capture")]
+        workspace::visual_test_capture::capture(cx, "project-search-reset")
+            .expect("reset scope capture");
     }
 
     fn init_test(cx: &mut TestAppContext) {

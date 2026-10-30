@@ -31,6 +31,7 @@ mod git;
 mod highlight_matching_bracket;
 pub mod hover_links;
 pub mod hover_popover;
+mod image_paste;
 mod indent_guides;
 mod inlays;
 mod inline_input;
@@ -70,11 +71,14 @@ mod config;
 mod cursor_animation;
 mod diagnostics;
 mod edit_prediction;
+mod extension_commands;
 mod input;
 mod markdown_actions;
 mod navigation;
+mod personal_actions;
 mod rewrap;
 mod selection;
+mod selection_tools;
 
 pub(crate) use actions::*;
 pub use clipboard::ClipboardSelection;
@@ -964,6 +968,7 @@ struct SettledScrollRange {
 ///
 /// See the [module level documentation](self) for more information.
 pub struct Editor {
+    file_open_hooks_run: Vec<extension_commands::FileOpenHookRun>,
     focus_handle: FocusHandle,
     last_focused_descendant: Option<WeakFocusHandle>,
     /// The text buffer being edited
@@ -2361,6 +2366,7 @@ impl Editor {
         }
 
         let mut editor = Self {
+            file_open_hooks_run: Vec::new(),
             focus_handle,
             show_cursor_when_unfocused: false,
             last_focused_descendant: None,
@@ -2545,6 +2551,13 @@ impl Editor {
                         cx.observe_in(&display_map, window, Self::on_display_map_changed),
                         cx.observe(&blink_manager, |_, _, cx| cx.notify()),
                         cx.observe_global_in::<SettingsStore>(window, Self::settings_changed),
+                        cx.observe_global_in::<SettingsStore>(window, |editor, window, cx| {
+                            editor.run_file_open_hooks(window, cx)
+                        }),
+                        cx.observe_global_in::<extension::editor_commands::EditorCommands>(
+                            window,
+                            |editor, window, cx| editor.run_file_open_hooks(window, cx),
+                        ),
                         cx.observe_global_in::<GlobalTheme>(window, Self::theme_changed),
                         observe_buffer_font_size_adjustment(cx, |_, cx| cx.notify()),
                     ]
@@ -2615,6 +2628,10 @@ impl Editor {
                     .shared(),
             );
         }
+
+        cx.defer_in(window, |editor, window, cx| {
+            editor.run_file_open_hooks(window, cx)
+        });
 
         if is_minimap {
             return editor;
@@ -9186,6 +9203,41 @@ impl Editor {
         }
     }
 
+    pub fn set_indentation(
+        &mut self,
+        action: &SetIndentation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_size) = NonZeroU32::new(action.tab_size) else {
+            return;
+        };
+        let Some(buffer) = self.buffer.read(cx).as_singleton() else {
+            self.notify_personal_error(
+                "Indentation can only be set in a single-file editor.",
+                window,
+                cx,
+            );
+            return;
+        };
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_indentation(tab_size, action.hard_tabs, cx)
+        });
+    }
+
+    pub fn insert_date(&mut self, _: &InsertDate, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_extension_command("myext0", "insert-date", window, cx);
+    }
+
+    pub fn insert_date_time(
+        &mut self,
+        _: &InsertDateTime,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_extension_command("myext0", "insert-date-time", window, cx);
+    }
+
     pub fn insert_uuid_v4(
         &mut self,
         _: &InsertUuidV4,
@@ -10258,6 +10310,7 @@ impl Editor {
             multi_buffer::Event::DirtyChanged => cx.emit(EditorEvent::DirtyChanged),
             multi_buffer::Event::Saved => cx.emit(EditorEvent::Saved),
             multi_buffer::Event::FileHandleChanged => {
+                self.run_file_open_hooks(window, cx);
                 cx.emit(EditorEvent::TitleChanged);
                 cx.emit(EditorEvent::FileHandleChanged);
             }
