@@ -2,9 +2,11 @@
 mod file_finder_tests;
 #[cfg(test)]
 mod multi_select_tests;
+mod unloaded_ignored_files;
 
 use futures::future::join_all;
 pub use open_path_prompt::OpenPathDelegate;
+use project::search_scope::SearchScope;
 
 use anyhow::Context as _;
 use channel::ChannelStore;
@@ -40,6 +42,9 @@ use std::{
     time::Duration,
 };
 use ui::{Checkbox, HighlightedLabel, ListItem, ListItemSpacing, Tooltip, prelude::*};
+use unloaded_ignored_files::{
+    UnloadedIgnoredCandidateSet, UnloadedIgnoredFiles, is_excluded, walk_unloaded_ignored_files,
+};
 use util::{
     ResultExt, maybe,
     paths::{PathStyle, PathWithPosition},
@@ -59,7 +64,9 @@ actions!(
         SelectPrevious,
         /// Opens the selected file in the editor without dismissing the file finder,
         /// so additional files can be opened in sequence.
-        OpenWithoutDismiss
+        OpenWithoutDismiss,
+        /// Hides the selected file by adding it to `zhack.search.exclusions`.
+        ExcludeSelected
     ]
 );
 
@@ -100,9 +107,31 @@ impl FileFinder {
                 };
 
                 file_finder.update(cx, |file_finder, cx| {
-                    file_finder.init_modifiers = Some(window.modifiers());
+                    file_finder.init_modifiers = (!file_finder
+                        .picker
+                        .read(cx)
+                        .delegate
+                        .search_scope
+                        .is_configured())
+                    .then_some(window.modifiers());
                     file_finder.picker.update(cx, |picker, cx| {
-                        picker.cycle_selection(window, cx);
+                        if picker.delegate.search_scope.is_configured() {
+                            picker.delegate.toggle_search_scope(cx);
+                            picker
+                                .delegate
+                                .cancel_flag
+                                .store(true, atomic::Ordering::Relaxed);
+                            picker.delegate.latest_search_id =
+                                post_inc(&mut picker.delegate.search_count);
+                            picker.delegate.latest_search_query = None;
+                            picker.delegate.first_update = true;
+                            picker.delegate.matches = Matches::default();
+                            picker.delegate.selected_matches.clear();
+                            picker.delegate.invalidate_ignored_walk();
+                            picker.refresh(window, cx);
+                        } else {
+                            picker.cycle_selection(window, cx);
+                        }
                     });
                 });
             },
@@ -118,7 +147,6 @@ impl FileFinder {
         cx: &mut Context<Workspace>,
     ) -> Task<()> {
         let project = workspace.project().read(cx);
-
         let currently_opened_path = workspace.active_item(cx).and_then(|item| {
             let project_path = item.project_path(cx)?;
             let abs_path = project
@@ -207,6 +235,7 @@ impl FileFinder {
         let modal_max_width_setting = FileFinderSettings::get_global(cx).modal_max_width;
 
         let project = delegate.project.clone();
+        let scope_configured = delegate.search_scope.is_configured();
         let modal_max_width = Self::modal_max_width(modal_max_width_setting, window);
         let preview = picker_preview::editor_preview(project, window, cx);
         let picker = cx.new(|cx| {
@@ -225,7 +254,8 @@ impl FileFinder {
         Self {
             picker,
             picker_focus_handle,
-            init_modifiers: window.modifiers().modified().then_some(window.modifiers()),
+            init_modifiers: (!scope_configured && window.modifiers().modified())
+                .then_some(window.modifiers()),
         }
     }
 
@@ -311,6 +341,51 @@ impl FileFinder {
         self.go_to_file_split_inner(SplitDirection::Down, window, cx)
     }
 
+    fn exclude_selected(
+        &mut self,
+        _: &ExcludeSelected,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.picker.update(cx, |picker, cx| {
+            let delegate = &mut picker.delegate;
+            let selected_index = delegate.selected_index();
+            let Some(path) = delegate
+                .matches
+                .get(selected_index)
+                .and_then(Match::relative_path)
+                .filter(|path| !path.is_empty())
+                .cloned()
+            else {
+                return;
+            };
+            // Exclusions are global, so match the path under any worktree root.
+            let glob = format!("**/{}", globset::escape(path.as_unix_str()));
+            let fs = delegate.project.read(cx).fs().clone();
+            settings::update_settings_file(fs, cx, move |settings, _| {
+                let exclusions = settings
+                    .project
+                    .zhack
+                    .get_or_insert_default()
+                    .search
+                    .get_or_insert_default()
+                    .exclusions
+                    .get_or_insert_default();
+                let exclusions = &mut exclusions.0;
+                if !exclusions.contains(&glob) {
+                    exclusions.push(glob);
+                }
+            });
+            // The settings file is reloaded asynchronously, so hide the entry right away.
+            let removed = delegate.matches.matches.remove(selected_index);
+            delegate
+                .selected_matches
+                .retain(|selected| selected != &removed);
+            delegate.selected_index = selected_index.min(delegate.matches.len().saturating_sub(1));
+            cx.notify();
+        })
+    }
+
     fn go_to_file_split_inner(
         &mut self,
         split_direction: SplitDirection,
@@ -394,6 +469,7 @@ impl Render for FileFinder {
             .on_action(cx.listener(Self::go_to_file_split_up))
             .on_action(cx.listener(Self::go_to_file_split_down))
             .on_action(cx.listener(Self::open_without_dismiss))
+            .on_action(cx.listener(Self::exclude_selected))
             .child(self.picker.clone())
     }
 }
@@ -416,12 +492,16 @@ pub struct FileFinderDelegate {
     search_in_flight: Arc<AtomicBool>,
     history_items: Vec<FoundPath>,
     history_refresh: Task<()>,
+    unloaded_ignored_files: Option<Vec<Arc<UnloadedIgnoredFiles>>>,
+    unloaded_ignored_walk: Option<Task<()>>,
     separate_history: bool,
     first_update: bool,
     focus_handle: FocusHandle,
     include_ignored: Option<bool>,
     include_ignored_refresh: Task<()>,
     debounce_next_refresh: bool,
+    search_scope: SearchScope,
+    pending_scope_change: Option<Task<()>>,
 }
 
 /// Use a custom ordering for file finder: the regular one
@@ -687,8 +767,8 @@ impl Matches {
                 Ok(_duplicate) => continue,
                 Err(i) => {
                     self.matches.insert(i, new_match);
-                    if self.matches.len() == 100 {
-                        break;
+                    if self.matches.len() > 100 {
+                        self.matches.pop();
                     }
                 }
             }
@@ -896,6 +976,14 @@ fn worktree_names_for_history_matching(
     if names.is_empty() { None } else { Some(names) }
 }
 
+fn search_path_prefix(worktree: &Worktree, include_root_name: bool) -> Arc<RelPath> {
+    if include_root_name {
+        worktree.root_name().into()
+    } else {
+        RelPath::empty_arc()
+    }
+}
+
 fn project_path_for_search_match(
     project: &Entity<Project>,
     path_match: &PathMatch,
@@ -1077,7 +1165,10 @@ impl FileFinderDelegate {
         } else {
             None
         };
+        let search_scope = SearchScope::new(project.read(cx), cx);
         Self {
+            search_scope,
+            pending_scope_change: None,
             file_finder,
             workspace,
             project,
@@ -1095,12 +1186,40 @@ impl FileFinderDelegate {
             search_in_flight: Arc::new(AtomicBool::new(false)),
             history_items,
             history_refresh: Task::ready(()),
+            unloaded_ignored_files: None,
+            unloaded_ignored_walk: None,
             separate_history,
             first_update: true,
             focus_handle: cx.focus_handle(),
             include_ignored: include_ignored.or(FileFinderSettings::get_global(cx).include_ignored),
             include_ignored_refresh: Task::ready(()),
             debounce_next_refresh: false,
+        }
+    }
+
+    fn toggle_search_scope(&mut self, cx: &mut Context<Picker<Self>>) {
+        self.pending_scope_change = None;
+        self.search_scope.expanded = !self.search_scope.expanded;
+        if self.search_scope.expanded {
+            let prepare = self
+                .project
+                .update(cx, |project, cx| self.search_scope.prepare(project, cx));
+            let workspace = self.workspace.clone();
+            let finder_id = self.file_finder.entity_id();
+            self.pending_scope_change = Some(cx.spawn(async move |_, cx| {
+                if let Err(error) = prepare.await {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            if workspace
+                                .active_modal::<FileFinder>(cx)
+                                .is_some_and(|finder| finder.entity_id() == finder_id)
+                            {
+                                workspace.show_error(error, cx);
+                            }
+                        })
+                        .log_err();
+                }
+            }));
         }
     }
 
@@ -1111,17 +1230,48 @@ impl FileFinderDelegate {
     ) {
         cx.subscribe_in(project, window, |file_finder, _, event, window, cx| {
             match event {
-                project::Event::WorktreeUpdatedEntries(_, _) => {
+                project::Event::WorktreeUpdatedEntries(id, changes) => {
                     file_finder.picker.update(cx, |picker, cx| {
+                        if picker.delegate.unloaded_ignored_walk.is_some()
+                            && let Some(tree) =
+                                picker.delegate.project.read(cx).worktree_for_id(*id, cx)
+                            && tree.read(cx).is_visible()
+                            && picker
+                                .delegate
+                                .search_scope
+                                .includes_path(tree.read(cx).abs_path().as_ref())
+                            && changes.iter().any(|(path, entry_id, change)| {
+                                if matches!(change, project::PathChange::Removed) {
+                                    return picker
+                                        .delegate
+                                        .unloaded_ignored_files
+                                        .as_ref()
+                                        .is_none_or(|trees| {
+                                            trees
+                                                .iter()
+                                                .find(|tree| tree.worktree_id == *id)
+                                                .is_some_and(|tree| {
+                                                    tree.contains_path_or_descendant(path)
+                                                })
+                                        });
+                                }
+                                tree.read(cx).entry_for_id(*entry_id).is_some_and(|entry| {
+                                    entry.kind == project::EntryKind::UnloadedDir
+                                })
+                            })
+                        {
+                            picker.delegate.invalidate_ignored_walk();
+                        }
                         picker.delegate.refresh_history(window, cx);
                         picker.delegate.debounce_next_refresh = true;
                         picker.refresh(window, cx);
                     })
                 }
                 project::Event::WorktreeAdded(_) | project::Event::WorktreeRemoved(_) => {
-                    file_finder
-                        .picker
-                        .update(cx, |picker, cx| picker.refresh(window, cx))
+                    file_finder.picker.update(cx, |picker, cx| {
+                        picker.delegate.invalidate_ignored_walk();
+                        picker.refresh(window, cx);
+                    })
                 }
                 _ => {}
             };
@@ -1272,9 +1422,14 @@ impl FileFinderDelegate {
         let worktrees = worktree_store
             .read(cx)
             .visible_worktrees_and_single_files(cx)
+            .filter(|worktree| {
+                self.search_scope
+                    .includes_path(worktree.read(cx).abs_path().as_ref())
+            })
             .collect::<Vec<_>>();
         let include_root_name = !should_hide_root_in_entry_path(&worktree_store, cx);
         let path_style = self.project.read(cx).path_style(cx);
+        let exclusions = FileFinderSettings::get_global(cx).exclusions.clone();
         let mut exact_matches = Vec::new();
         if !query.path_query().ends_with(path_style.separators_ch())
             && let Ok(query_path) = RelPath::new(Path::new(query.path_query()), path_style)
@@ -1288,12 +1443,21 @@ impl FileFinderDelegate {
                     .then(|| query_path.strip_prefix(worktree.root_name()).ok())
                     .flatten();
                 for path in std::iter::once(query_path.as_ref()).chain(prefixed_path) {
+                    if is_excluded(&exclusions, path) {
+                        continue;
+                    }
                     let project_path = ProjectPath {
                         worktree_id: worktree.id(),
                         path: Arc::from(path),
                     };
-                    if worktree.entry_for_path(path).is_some()
-                        || !WorktreeSettings::get(Some(SettingsLocation::from(&project_path)), cx)
+                    let lookup_ignored =
+                        self.include_ignored != Some(false) && worktree.is_path_ignored(path);
+                    if let Some(entry) = worktree.entry_for_path(path) {
+                        if !lookup_ignored || !entry.is_file() {
+                            continue;
+                        }
+                    } else if !lookup_ignored
+                        && !WorktreeSettings::get(Some(SettingsLocation::from(&project_path)), cx)
                             .is_path_excluded(path)
                     {
                         continue;
@@ -1327,11 +1491,41 @@ impl FileFinderDelegate {
                         resolve_path
                             .await
                             .filter(|path| path.is_file())
-                            .map(|_| ProjectPanelOrdMatch(path_match))
+                            .map(|_| path_match)
                     });
                 }
             }
         }
+        let walk_unloaded_ignored = self.should_walk_unloaded_ignored(cx);
+        if walk_unloaded_ignored {
+            self.start_unloaded_ignored_walk(window, cx);
+        }
+        let unloaded_ignored_candidate_sets = if walk_unloaded_ignored {
+            self.unloaded_ignored_files
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|files| {
+                    let worktree = worktree_store
+                        .read(cx)
+                        .worktree_for_id(files.worktree_id, cx)?;
+                    let worktree = worktree.read(cx);
+                    if !self
+                        .search_scope
+                        .includes_path(worktree.abs_path().as_ref())
+                    {
+                        return None;
+                    }
+                    Some(UnloadedIgnoredCandidateSet {
+                        files: files.clone(),
+                        prefix: search_path_prefix(worktree, include_root_name),
+                        path_style: worktree.path_style(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let candidate_sets = worktrees
             .into_iter()
             .map(|worktree| {
@@ -1352,26 +1546,39 @@ impl FileFinderDelegate {
         self.cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_flag = self.cancel_flag.clone();
         cx.spawn_in(window, async move |picker, cx| {
-            let matches = fuzzy_nucleo::match_path_sets(
+            let include = |path: &RelPath| !is_excluded(&exclusions, path);
+            let exact_matches = join_all(exact_matches).await.into_iter().flatten();
+            let options = fuzzy_nucleo::PathMatchOptions {
+                max_results: fuzzy_nucleo::MaxResults::limit::<100>(),
+                cancel_flag: Some(&cancel_flag),
+                ..Default::default()
+            };
+            let fuzzy_matches = fuzzy_nucleo::match_path_sets_filtered(
                 candidate_sets.as_slice(),
                 query.path_query(),
                 &relative_to,
-                fuzzy_nucleo::PathMatchOptions {
-                    max_results: fuzzy_nucleo::MaxResults::limit::<100>(),
-                    cancel_flag: Some(&cancel_flag),
-                    ..Default::default()
-                },
+                options,
                 cx.background_executor().clone(),
+                include,
             )
-            .await
-            .into_iter()
-            .map(ProjectPanelOrdMatch);
-            let exact_matches = join_all(exact_matches)
-                .await
-                .into_iter()
-                .flatten()
+            .await;
+            let unloaded_ignored_matches = fuzzy_nucleo::match_path_sets_filtered(
+                unloaded_ignored_candidate_sets.as_slice(),
+                query.path_query(),
+                &relative_to,
+                options,
+                cx.background_executor().clone(),
+                include,
+            )
+            .await;
+            // Keep the exact match's score when a path also appears in the ignored-file walk.
+            let mut seen_paths = collections::HashSet::default();
+            let matches = exact_matches
+                .chain(fuzzy_matches)
+                .chain(unloaded_ignored_matches)
+                .filter(|m| seen_paths.insert((m.worktree_id, m.path.clone())))
+                .map(ProjectPanelOrdMatch)
                 .collect::<Vec<_>>();
-            let matches = exact_matches.into_iter().chain(matches);
             let did_cancel = cancel_flag.load(atomic::Ordering::Acquire);
             picker
                 .update(cx, |picker, cx| {
@@ -1381,6 +1588,34 @@ impl FileFinderDelegate {
                 })
                 .ok();
         })
+    }
+
+    fn invalidate_ignored_walk(&mut self) {
+        self.unloaded_ignored_walk = None;
+        self.unloaded_ignored_files = None;
+    }
+
+    fn should_walk_unloaded_ignored(&self, cx: &App) -> bool {
+        self.include_ignored == Some(true)
+            && FileFinderSettings::get_global(cx).walk_unloaded_ignored
+            && self.project.read(cx).is_local()
+    }
+
+    fn start_unloaded_ignored_walk(&mut self, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        if self.unloaded_ignored_walk.is_some() {
+            return;
+        }
+        let exclusions = FileFinderSettings::get_global(cx).exclusions.clone();
+        let walk = walk_unloaded_ignored_files(&self.project, exclusions, &self.search_scope, cx);
+        self.unloaded_ignored_walk = Some(cx.spawn_in(window, async move |picker, cx| {
+            let files = walk.await;
+            picker
+                .update_in(cx, |picker, window, cx| {
+                    picker.delegate.unloaded_ignored_files = Some(files);
+                    picker.refresh(window, cx);
+                })
+                .log_err();
+        }));
     }
 
     fn set_search_matches(
@@ -1416,11 +1651,16 @@ impl FileFinderDelegate {
             };
 
             let path_style = self.project.read(cx).path_style(cx);
+            let exclusions = &FileFinderSettings::get_global(cx).exclusions;
+            let in_scope = |item: &&FoundPath| {
+                !is_excluded(exclusions, &item.project.path)
+                    && self.search_scope.includes_path(&item.absolute)
+            };
             self.matches.push_new_matches(
                 self.project.read(cx).worktree_store(),
                 cx,
-                &self.history_items,
-                self.currently_opened_path.as_ref(),
+                self.history_items.iter().filter(in_scope),
+                self.currently_opened_path.as_ref().filter(in_scope),
                 Some(&query),
                 matches.into_iter(),
                 extend_old_matches,
@@ -1496,35 +1736,36 @@ impl FileFinderDelegate {
                     .project
                     .read(cx)
                     .visible_worktrees(cx)
-                    .filter(|worktree| !worktree.read(cx).is_single_file())
+                    .filter(|worktree| {
+                        !worktree.read(cx).is_single_file()
+                            && self
+                                .search_scope
+                                .includes_path(worktree.read(cx).abs_path().as_ref())
+                    })
                     .collect::<Vec<_>>();
-                let worktree_count = available_worktree.len();
-                let mut expect_worktree = available_worktree.first().cloned();
-                for worktree in &available_worktree {
-                    let worktree_root = worktree.read(cx).root_name();
-                    if worktree_count > 1 {
-                        if let Ok(suffix) = query_path.strip_prefix(worktree_root) {
+                let mut expect_worktree = self
+                    .currently_opened_path
+                    .as_ref()
+                    .and_then(|focused| {
+                        available_worktree
+                            .iter()
+                            .find(|tree| tree.read(cx).id() == focused.project.worktree_id)
+                    })
+                    .or_else(|| available_worktree.first());
+                if available_worktree.len() > 1 {
+                    for worktree in &available_worktree {
+                        if let Ok(suffix) = query_path.strip_prefix(worktree.read(cx).root_name()) {
                             query_path = Cow::Owned(suffix.to_owned());
-                            expect_worktree = Some(worktree.clone());
+                            expect_worktree = Some(worktree);
                             break;
                         }
                     }
                 }
 
-                if let Some(FoundPath { ref project, .. }) = self.currently_opened_path {
-                    let worktree_id = project.worktree_id;
-                    let focused_file_in_available_worktree = available_worktree
-                        .iter()
-                        .any(|wt| wt.read(cx).id() == worktree_id);
-
-                    if focused_file_in_available_worktree {
-                        expect_worktree = self.project.read(cx).worktree_for_id(worktree_id, cx);
-                    }
-                }
-
                 if let Some(worktree) = expect_worktree {
                     let worktree = worktree.read(cx);
-                    if worktree.entry_for_path(&query_path).is_none()
+                    if !is_excluded(exclusions, &query_path)
+                        && worktree.entry_for_path(&query_path).is_none()
                         && !self.matches.matches.iter().any(|entry| {
                             entry.panel_match().is_some_and(|path_match| {
                                 (path_match.0.worktree_id == worktree.id().to_usize()
@@ -1773,8 +2014,15 @@ impl FileFinderDelegate {
         };
         let project = self.project.read(cx);
         let mut absolute_paths = Vec::new();
-        for worktree in project.worktrees(cx) {
+        for worktree in project.visible_worktrees(cx) {
             let worktree = worktree.read(cx);
+            if worktree.is_single_file()
+                || !self
+                    .search_scope
+                    .includes_path(worktree.abs_path().as_ref())
+            {
+                continue;
+            }
             if let Some(entry) = worktree.entry_for_path(prefix) {
                 if entry.is_dir() {
                     return Task::ready(false);
@@ -1812,6 +2060,12 @@ impl FileFinderDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Task<bool> {
+        if !self
+            .search_scope
+            .includes_path(Path::new(query.path_query()))
+        {
+            return Task::ready(false);
+        }
         let project = self.project.clone();
         let search_id = post_inc(&mut self.search_count);
         let resolve_path = project.update(cx, |project, cx| {
@@ -1849,6 +2103,8 @@ impl FileFinderDelegate {
                             })
                         });
                     let outside_project = path_match.is_none();
+                    let exclusions = &FileFinderSettings::get_global(cx).exclusions;
+                    let path_match = path_match.filter(|m| !is_excluded(exclusions, &m.0.path));
                     delegate.set_search_matches(search_id, false, query, path_match, cx);
                     if outside_project {
                         delegate.matches.matches.retain(|entry| {
@@ -2148,6 +2404,12 @@ impl PickerDelegate for FileFinderDelegate {
             h_flex()
                 .gap_1()
                 .child(filter_button)
+                .when(self.search_scope.is_configured(), |element| {
+                    element.child(
+                        Label::new(self.search_scope.label(self.project.read(cx), cx))
+                            .size(LabelSize::Small),
+                    )
+                })
                 .children(picker::parts::project_scan_indicator(
                     self.latest_search_query.is_some(),
                     &self.project,
@@ -2208,6 +2470,15 @@ impl PickerDelegate for FileFinderDelegate {
             Some((prefix @ ("a" | "b"), _)) => (raw_query, Some(prefix.to_owned())),
             _ => (raw_query, None),
         };
+        // `~/` is not an absolute path, so expand it to reach the absolute path lookup.
+        let expanded_query;
+        let raw_query = match raw_query.strip_prefix("~/") {
+            Some(rest) if self.project.read(cx).is_local() => {
+                expanded_query = util::paths::home_dir().join(rest);
+                expanded_query.to_str().unwrap_or(raw_query)
+            }
+            _ => raw_query,
+        };
 
         if raw_query.is_empty() {
             // if there was no query before, and we already have some (history) matches
@@ -2223,16 +2494,19 @@ impl PickerDelegate for FileFinderDelegate {
                     ..Matches::default()
                 };
                 let path_style = self.project.read(cx).path_style(cx);
+                let exclusions = &FileFinderSettings::get_global(cx).exclusions;
 
                 self.matches.push_new_matches(
                     project.worktree_store(),
                     cx,
                     self.history_items.iter().filter(|history_item| {
-                        project
+                        (project
                             .worktree_for_id(history_item.project.worktree_id, cx)
                             .is_some()
                             || project.is_local()
-                            || project.is_via_remote_server()
+                            || project.is_via_remote_server())
+                            && !is_excluded(exclusions, &history_item.project.path)
+                            && self.search_scope.includes_path(&history_item.absolute)
                     }),
                     self.currently_opened_path.as_ref(),
                     None,

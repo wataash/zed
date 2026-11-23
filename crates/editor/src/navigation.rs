@@ -1,6 +1,124 @@
 use super::*;
 
 impl Editor {
+    pub(crate) async fn choose_binary_link(
+        workspace: &Entity<Workspace>,
+        resolved: &project::ResolvedPath,
+        cx: &mut gpui::AsyncWindowContext,
+    ) -> anyhow::Result<bool> {
+        let candidate = workspace.read_with(cx, |workspace, cx| {
+            let project = workspace.project().read(cx);
+            if !project.is_local() {
+                return None;
+            }
+            let path = match resolved {
+                project::ResolvedPath::ProjectPath {
+                    project_path,
+                    is_dir: false,
+                } => project.absolute_path(project_path, cx)?,
+                project::ResolvedPath::AbsPath {
+                    path,
+                    is_dir: false,
+                } => std::path::PathBuf::from(path),
+                _ => return None,
+            };
+            let project_path = project.project_path_for_absolute_path(&path, cx);
+            let location = project_path
+                .as_ref()
+                .map(|path| settings::SettingsLocation {
+                    worktree_id: path.worktree_id,
+                    path: path.path.as_ref(),
+                });
+            let options = ProjectSettings::get(location, cx)
+                .binary_file_options
+                .clone();
+            Some((path, options))
+        });
+        let Some((path, options)) = candidate else {
+            return Ok(false);
+        };
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                let extension = extension.to_ascii_lowercase();
+                gpui::Img::extensions().contains(&extension.as_str())
+            })
+        {
+            return Ok(false);
+        }
+        let probe_path = path.clone();
+        let binary = cx
+            .background_spawn(async move { workspace::binary_files::is_binary_file(&probe_path) })
+            .await;
+        // Let the normal opener report missing paths and other I/O errors.
+        if !binary.unwrap_or(false) {
+            return Ok(false);
+        }
+        let preview = workspace
+            .update_in(cx, |_, _, cx| {
+                workspace::binary_files::present_file(&path, 0, "link", options, cx)
+            })?
+            .await;
+        let Some(preview) = preview.log_err() else {
+            return Ok(false);
+        };
+        match preview.presentation.action {
+            Some(zed_editor_command_api::FilePreviewAction::OpenView) => Ok(false),
+            Some(zed_editor_command_api::FilePreviewAction::OpenWithSystem) => {
+                cx.update(|_, cx| cx.open_with_system(&path))?;
+                Ok(true)
+            }
+            None => {
+                if preview.presentation.actions.is_empty() {
+                    return Ok(false);
+                }
+                workspace.update_in(cx, |workspace, window, cx| {
+                    let weak_workspace = cx.weak_entity();
+                    let menu = ui::ContextMenu::build(window, cx, |mut menu, _, _| {
+                        for choice in preview.presentation.actions {
+                            let path = path.clone();
+                            let weak_workspace = weak_workspace.clone();
+                            menu = menu.entry(choice.label, None, move |window, cx| {
+                                match choice.action {
+                                    zed_editor_command_api::FilePreviewAction::OpenView => {
+                                        weak_workspace
+                                            .update(cx, |workspace, cx| {
+                                                workspace
+                                                    .open_abs_path(
+                                                        path.clone(),
+                                                        Default::default(),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                    .detach_and_log_err(cx);
+                                            })
+                                            .log_err();
+                                    }
+                                    zed_editor_command_api::FilePreviewAction::OpenWithSystem => {
+                                        cx.open_with_system(&path)
+                                    }
+                                }
+                            });
+                        }
+                        menu
+                    });
+                    if let Some(editor) = workspace.active_item_as::<Editor>(cx) {
+                        editor.update(cx, |editor, cx| {
+                            editor.deploy_mouse_context_menu(
+                                window.mouse_position(),
+                                menu,
+                                window,
+                                cx,
+                            )
+                        });
+                    }
+                })?;
+                Ok(true)
+            }
+        }
+    }
+
     pub fn move_left(&mut self, _: &MoveLeft, window: &mut Window, cx: &mut Context<Self>) {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_with(&mut |map, selection| {
@@ -1146,6 +1264,7 @@ impl Editor {
             None
         };
 
+        let workspace = self.workspace();
         let url_finder = cx.spawn_in(window, async move |_editor, cx| {
             let url = if let Some(end_pos) = end_position {
                 find_url_from_range(&buffer, start_position..end_pos, cx)
@@ -1161,7 +1280,7 @@ impl Editor {
                             cx,
                         );
                     } else {
-                        cx.open_url(&url);
+                        hover_popover::open_markdown_url(workspace, url.into(), window, cx);
                     }
                 })?;
             }
@@ -1196,6 +1315,14 @@ impl Editor {
             let result = find_file(&buffer, project, buffer_position, cx).await;
 
             if let Some((_, file_target)) = result {
+                if workspace.update_in(cx, |workspace, _, cx| {
+                    workspace.open_video_link_with_system(&file_target.resolved_path, cx)
+                })? {
+                    return anyhow::Ok(());
+                }
+                if Self::choose_binary_link(&workspace, &file_target.resolved_path, cx).await? {
+                    return anyhow::Ok(());
+                }
                 let item = workspace
                     .update_in(cx, |workspace, window, cx| {
                         workspace.open_resolved_path(file_target.resolved_path.clone(), window, cx)
@@ -1862,7 +1989,7 @@ impl Editor {
                                     cx,
                                 );
                             } else {
-                                cx.open_url(&url);
+                                hover_popover::open_markdown_url(workspace, url.into(), window, cx);
                             }
                         })?;
                         Ok(Navigated::Yes)
@@ -1874,6 +2001,16 @@ impl Editor {
                         let Some(workspace) = workspace else {
                             return Ok(Navigated::No);
                         };
+                        if workspace.update_in(cx, |workspace, _, cx| {
+                            workspace.open_video_link_with_system(&file_target.resolved_path, cx)
+                        })? {
+                            return Ok(Navigated::Yes);
+                        }
+                        if Self::choose_binary_link(&workspace, &file_target.resolved_path, cx)
+                            .await?
+                        {
+                            return Ok(Navigated::Yes);
+                        }
                         let item = workspace
                             .update_in(cx, |workspace, window, cx| {
                                 workspace.open_resolved_path(

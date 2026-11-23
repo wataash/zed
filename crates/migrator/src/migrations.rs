@@ -2,42 +2,57 @@ use anyhow::Result;
 use serde_json::Value;
 use settings_content::{PlatformOverrides, ReleaseChannelOverrides};
 
+pub(crate) mod zhack;
+
 /// Applies a migration callback to the root settings object as well as all
 /// nested platform, release-channel, and profile override objects.
 pub(crate) fn migrate_settings(
     value: &mut Value,
     migrate_one: &mut dyn FnMut(&mut serde_json::Map<String, Value>) -> Result<()>,
 ) -> Result<()> {
+    migrate_settings_with_inheritance(value, &mut |settings, _| {
+        migrate_one(settings)?;
+        Ok(false)
+    })
+}
+
+/// The callback reports whether it introduced a value that higher-priority layers
+/// may inherit. Sibling channels (or platforms) never inherit from each other.
+fn migrate_settings_with_inheritance(
+    value: &mut Value,
+    migrate_one: &mut dyn FnMut(&mut serde_json::Map<String, Value>, bool) -> Result<bool>,
+) -> Result<()> {
     let Some(root_object) = value.as_object_mut() else {
         return Ok(());
     };
 
-    migrate_one(root_object)?;
-
-    let override_keys = ReleaseChannelOverrides::OVERRIDE_KEYS
-        .iter()
-        .copied()
-        .chain(PlatformOverrides::OVERRIDE_KEYS.iter().copied());
-
-    for key in override_keys {
-        if let Some(sub_object) = root_object.get_mut(key) {
-            if let Some(sub_map) = sub_object.as_object_mut() {
-                migrate_one(sub_map)?;
+    let mut inherited = migrate_one(root_object, false)?;
+    for keys in [
+        ReleaseChannelOverrides::OVERRIDE_KEYS,
+        PlatformOverrides::OVERRIDE_KEYS,
+    ] {
+        let mut introduced = false;
+        for key in keys {
+            if let Some(settings) = root_object.get_mut(*key).and_then(Value::as_object_mut) {
+                introduced |= migrate_one(settings, inherited)?;
             }
         }
+        inherited |= introduced;
     }
 
     if let Some(profiles) = root_object.get_mut("profiles") {
         if let Some(profiles_object) = profiles.as_object_mut() {
             for profile_value in profiles_object.values_mut() {
                 if let Some(profile_map) = profile_value.as_object_mut() {
+                    let inherits = inherited
+                        && profile_map.get("base").and_then(Value::as_str) != Some("default");
                     if let Some(inner) = profile_map
                         .get_mut("settings")
                         .and_then(|v| v.as_object_mut())
                     {
-                        migrate_one(inner)?;
+                        migrate_one(inner, inherits)?;
                     } else {
-                        migrate_one(profile_map)?;
+                        migrate_one(profile_map, inherits)?;
                     }
                 }
             }

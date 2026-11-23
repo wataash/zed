@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 Wataru Ashihara <wataash0607@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+repository=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+scratch=$(mktemp -d /tmp/zed-auto-integration.XXXXXX)
+runner='' monitor=''
+cleanup() {
+    touch "$scratch/stop"
+    if [[ -n $monitor ]]; then kill -TERM "$monitor" 2>/dev/null || true; wait "$monitor" || true; fi
+    if [[ -n $runner ]]; then wait "$runner" || true; fi
+    rm -rf "$scratch"
+}
+trap cleanup EXIT
+mkdir -p "$scratch/script/"
+cp "$repository/script/low-load" "$repository/script/low-load-auto.py" "$scratch/script/"
+wrapper_output=$(env ZED_LOW_LOAD_CARGO_WRAPPER=1 ZED_LOW_LOAD_REAL_CARGO=/bin/echo "$scratch/script/low-load" clippy --config .cargo/release-quick.toml --release --locked)
+[[ $wrapper_output == 'clippy --config .cargo/release-quick.toml --profile release-quick --locked' ]]
+cat > "$scratch/cargo" <<'CARGO'
+#!/usr/bin/env bash
+set -euo pipefail
+while [[ ! -e $MOCK_STOP ]]; do sleep 0.05; done
+CARGO
+chmod +x "$scratch/cargo"
+export CARGO="$scratch/cargo" MOCK_STOP="$scratch/stop" ZED_LOW_LOAD_DATA_DIR="$scratch/logs" MOCK_SAMPLE="$scratch/sample.json" MOCK_SCRIPT="$scratch/script/low-load-auto.py"
+printf '{"idle_ms": 300000, "latency_ms": 10, "memory_pressure": 0, "io_pressure": 0, "available_percent": 50}\n' > "$MOCK_SAMPLE"
+cat > "$scratch/monitor.py" <<'PY'
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location('auto', os.environ['MOCK_SCRIPT'])
+module = importlib.util.module_from_spec(spec)
+sys.modules['auto'] = module
+spec.loader.exec_module(module)
+def observe(*args):
+    with open(os.environ['MOCK_SAMPLE']) as stream:
+        return module.Sample(**json.load(stream))
+module.observe = observe
+raise SystemExit(module.main())
+PY
+"$scratch/script/low-load" build > "$scratch/run.log" 2>&1 &
+runner=$!
+for (( i=0; i<100; i++ )); do [[ -f $scratch/logs/latest/runner.tsv ]] && break; sleep 0.02; done
+python3 "$scratch/monitor.py" -q monitor --run-directory "$scratch/logs/latest" --interval 0.05 > "$scratch/monitor.log" 2>&1 &
+monitor=$!
+wait_reason() {
+    for (( i=0; i<100; i++ )); do
+        if [[ -f $scratch/logs/latest/auto-status.json ]] && rg -q "\"reason\": \"$1\"" "$scratch/logs/latest/auto-status.json"; then return; fi
+        sleep 0.02
+    done
+    cat "$scratch/monitor.log" >&2
+    return 1
+}
+wait_reason idle
+rg -q 'Load high: idle' "$scratch/monitor.log"
+printf '{"idle_ms": 0, "latency_ms": 10, "memory_pressure": 0, "io_pressure": 0, "available_percent": 50}\n' > "$MOCK_SAMPLE"
+wait_reason input-resumed
+rg -q 'Load low: input-resumed' "$scratch/monitor.log"
+"$scratch/script/low-load" --load medium
+wait "$monitor"
+monitor=
+[[ $(cat "$scratch/logs/latest/mode") == manual ]]
+[[ $(cut -f 1 "$scratch/logs/latest/resources.tsv" | tr ',' '\n' | wc -l) == 4 ]]
+# Stopping an automatic controller must restore low, rather than leave idle high.
+printf '{"idle_ms": 300000, "latency_ms": 10, "memory_pressure": 0, "io_pressure": 0, "available_percent": 50}\n' > "$MOCK_SAMPLE"
+python3 "$scratch/monitor.py" -q monitor --run-directory "$scratch/logs/latest" --interval 0.05 > "$scratch/monitor2.log" 2>&1 &
+monitor=$!
+wait_reason idle
+kill -TERM "$monitor"
+wait "$monitor"
+monitor=
+[[ $(cat "$scratch/logs/latest/mode") == manual ]]
+[[ $(cut -f 1 "$scratch/logs/latest/resources.tsv" | tr ',' '\n' | wc -l) == 2 ]]
+touch "$scratch/stop"
+wait "$runner"
+runner=
+printf 'PASS: idle high, input low, manual override, monitor exit restores low\n'

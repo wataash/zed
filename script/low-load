@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 Wataru Ashihara <wataash0607@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+
+script_path=$(realpath "${BASH_SOURCE[0]}")
+repository=$(dirname "$(dirname "$script_path")")
+cd "$repository/"
+
+# script/clippy requires --release; keep its checks while reusing release-quick artifacts.
+if [[ ${ZED_LOW_LOAD_CARGO_WRAPPER:-0} == 1 ]]; then
+    arguments=()
+    for argument in "$@"; do
+        if [[ $argument == --release ]]; then
+            arguments+=(--profile release-quick)
+        else
+            arguments+=("$argument")
+        fi
+    done
+    exec "${ZED_LOW_LOAD_REAL_CARGO:?}" "${arguments[@]}"
+fi
+
+phases=(worktree-watch worktree-settings related-library-tests project-settings command-history clippy licenses build)
+data_directory=${ZED_LOW_LOAD_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/wataash/zed-low-load}
+data_directory=$(realpath -m "$data_directory")
+
+process_start_time() {
+    local stat
+    read -r stat < "/proc/$1/stat" || return 1
+    # Remove pid and the parenthesized command, which can itself contain spaces.
+    stat=${stat##*) }
+    local fields=()
+    read -r -a fields <<< "$stat"
+    printf '%s\n' "${fields[19]}"
+}
+
+expand_cpus() {
+    allowed_cpus=()
+    local ranges=() range first last cpu
+    IFS=, read -r -a ranges <<< "$1"
+    for range in "${ranges[@]}"; do
+        first=${range%-*}
+        last=${range#*-}
+        for (( cpu=first; cpu<=last; cpu++ )); do allowed_cpus+=("$cpu"); done
+    done
+}
+
+select_cpus() {
+    local count=$1 cpu
+    cpus=
+    if (( count > ${#allowed_cpus[@]} )); then count=${#allowed_cpus[@]}; fi
+    for cpu in "${allowed_cpus[@]: -count}"; do
+        cpus+=${cpus:+,}$cpu
+    done
+}
+
+is_runner_descendant() {
+    local pid=$1 root=$2 stat
+    local fields=()
+    while [[ $pid != "$root" ]]; do
+        [[ $pid =~ ^[0-9]+$ && $pid -gt 1 ]] || return 1
+        read -r stat < "/proc/$pid/stat" || return 1
+        stat=${stat##*) }
+        read -r -a fields <<< "$stat"
+        pid=${fields[1]}
+    done
+}
+
+change_load() {
+    local level=$1 run_directory runner_pid runner_start runner_repository affinity actual_start jobs _previous_cpus
+    case "$level" in low|medium|high) ;; *) echo 'Load must be low, medium, or high' >&2; return 2 ;; esac
+    run_directory=$(realpath "${ZED_LOW_LOAD_RUN_DIR:-$data_directory/latest}")
+    exec 8> "$run_directory/control.lock"
+    flock 8
+    if [[ ${ZED_LOW_LOAD_AUTO_CONTROL:-0} == 1 ]]; then
+        [[ $(cat "$run_directory/mode" 2>/dev/null) == auto ]] || return 3
+    else
+        printf 'manual\n' > "$run_directory/mode"
+    fi
+    IFS=$'\t' read -r runner_pid runner_start runner_repository affinity < "$run_directory/runner.tsv"
+    [[ $runner_repository == "$repository" ]] || { echo 'Latest run belongs to another checkout' >&2; return 1; }
+    actual_start=$(process_start_time "$runner_pid") || { echo 'Runner is no longer active' >&2; return 1; }
+    [[ $actual_start == "$runner_start" ]] || { echo 'Runner PID has been reused' >&2; return 1; }
+    IFS=$'\t' read -r _previous_cpus jobs < "$run_directory/resources.tsv"
+    expand_cpus "$affinity"
+    case "$level" in
+        low) select_cpus 2 ;;
+        medium) select_cpus 4 ;;
+        high) select_cpus "${#allowed_cpus[@]}" ;;
+    esac
+    taskset -c "$cpus" true
+    printf '%s\t%s\n' "$cpus" "$jobs" > "$run_directory/resources.tsv.new"
+    mv "$run_directory/resources.tsv.new" "$run_directory/resources.tsv"
+
+    # Update parents before children so newly spawned processes inherit the new mask.
+    # A second pass catches descendants created while their parents were being updated.
+    local pass pid start current_start process_list
+    local processes=()
+    for (( pass=0; pass<2; pass++ )); do
+        actual_start=$(process_start_time "$runner_pid") || { echo 'Runner finished during load change' >&2; return 1; }
+        [[ $actual_start == "$runner_start" ]] || { echo 'Runner PID has been reused' >&2; return 1; }
+        process_list=$(ps -eo pid=,ppid= | awk -v root="$runner_pid" '
+            { children[$2] = children[$2] " " $1 }
+            function visit(pid, entries, count, entry) {
+                print pid
+                count = split(children[pid], entries, " ")
+                for (entry = 1; entry <= count; entry++) if (entries[entry] != "") visit(entries[entry])
+            }
+            END { visit(root) }
+        ')
+        mapfile -t processes <<< "$process_list"
+        for pid in "${processes[@]}"; do
+            if [[ ! -r /proc/$pid/stat ]]; then continue; fi
+            start=$(process_start_time "$pid") || continue
+            is_runner_descendant "$pid" "$runner_pid" || continue
+            current_start=$(process_start_time "$pid") || continue
+            if [[ $current_start != "$start" ]]; then continue; fi
+            if ! taskset -apc "$cpus" "$pid" > /dev/null; then
+                if [[ -d /proc/$pid ]]; then
+                    printf 'Could not change CPU affinity for PID %s\n' "$pid" >&2
+                    return 1
+                fi
+            fi
+        done
+    done
+    printf '%s\t%s\t%s\t%s\n' "$(date -Is)" "$level" "$cpus" "$jobs" >> "$run_directory/load-changes.tsv"
+    printf 'Load: %s; CPUs: %s; fixed Cargo jobs: %s\n' "$level" "$cpus" "$jobs"
+}
+
+usage() {
+    cat <<'USAGE'
+Usage: script/low-load [--dry-run] [--from PHASE | all | PHASE...]
+       script/low-load --status
+       script/low-load --load low|medium|high|auto
+
+Default: licenses build. 'all' runs these phases in order:
+  worktree-watch worktree-settings related-library-tests project-settings
+  command-history clippy licenses build
+
+Environment:
+  ZED_LOW_LOAD_JOBS       Fixed Cargo jobs (default: nproc at startup, before CPU limits)
+  ZED_LOW_LOAD_CPUS       taskset CPU list (default: last two allowed CPUs)
+  ZED_LOW_LOAD_OFFLINE    1 uses cached Cargo dependencies; 0 allows downloads (default: 1)
+  ZED_LOW_LOAD_DATA_DIR   Log directory (default: XDG_DATA_HOME/wataash/zed-low-load)
+
+Runs on Linux with nice 19, idle I/O priority, and one test thread.
+--load changes the latest active run in this checkout: low=2 CPUs,
+medium=4, high=all originally allowed CPUs. CPU affinity changes immediately
+for the runner and its descendants/threads; Cargo jobs remain fixed.
+CPU and I/O niceness remain low at every level; no root privileges are needed.
+No installation. --from explicitly reruns that phase and all subsequent phases.
+--auto starts automatic control with a build; --load auto attaches it to the
+latest runner in the foreground. Five minutes without input enables high.
+During desktop activity automatic load stays at low by default.
+Manual --load stops automatic control. GNOME response latency is a proxy,
+not a Sysprof frame measurement. Memory/I/O pressure limits apply even idle.
+USAGE
+}
+
+dry_run=false
+automatic=false
+selected=()
+while (( $# > 0 )); do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --auto) automatic=true ;;
+        --load)
+            [[ $# == 2 && ${#selected[@]} == 0 ]] || { usage >&2; exit 2; }
+            if [[ $2 == auto ]]; then
+                exec python3 "$repository/script/low-load-auto.py" -q monitor --run-directory "$data_directory/latest"
+            fi
+            change_load "$2"
+            exit 0
+            ;;
+        --status)
+            cat "$data_directory/latest/status"
+            printf 'Requested CPUs and fixed Cargo jobs:\n'
+            cat "$data_directory/latest/resources.tsv"
+            if [[ -f $data_directory/latest/auto-status.json ]]; then cat "$data_directory/latest/auto-status.json"; printf '\n'; fi
+            if [[ -f $data_directory/latest/mode ]]; then printf 'Mode: '; cat "$data_directory/latest/mode"; fi
+            cat "$data_directory/latest/results.tsv"
+            tail -n 20 "$data_directory/latest/output.log"
+            exit 0
+            ;;
+        --dry-run) dry_run=true ;;
+        --from)
+            [[ $# == 2 && ${#selected[@]} == 0 ]] || { usage >&2; exit 2; }
+            found=false
+            for phase in "${phases[@]}"; do
+                if [[ $phase == "$2" ]]; then found=true; fi
+                if $found; then selected+=("$phase"); fi
+            done
+            $found || { printf 'Unknown phase: %s\n' "$2" >&2; exit 2; }
+            shift
+            ;;
+        all)
+            [[ $# == 1 && ${#selected[@]} == 0 ]] || { usage >&2; exit 2; }
+            selected=("${phases[@]}")
+            ;;
+        *)
+            known=false
+            for phase in "${phases[@]}"; do
+                if [[ $phase == "$1" ]]; then known=true; break; fi
+            done
+            $known || { printf 'Unknown phase: %s\n' "$1" >&2; exit 2; }
+            selected+=("$1")
+            ;;
+    esac
+    shift
+done
+if (( ${#selected[@]} == 0 )); then selected=(licenses build); fi
+
+jobs=${ZED_LOW_LOAD_JOBS:-$(nproc)}
+[[ $jobs =~ ^[1-9][0-9]*$ ]] || { echo 'ZED_LOW_LOAD_JOBS must be a positive integer' >&2; exit 2; }
+[[ ${ZED_LOW_LOAD_OFFLINE:-1} =~ ^[01]$ ]] || { echo 'ZED_LOW_LOAD_OFFLINE must be 0 or 1' >&2; exit 2; }
+cpus=${ZED_LOW_LOAD_CPUS:-}
+affinity=$(awk '/^Cpus_allowed_list:/ { print $2 }' /proc/self/status)
+if [[ -z $cpus ]]; then
+    # Respect container/cgroup affinity instead of assuming CPU numbers start at zero.
+    expand_cpus "$affinity"
+    (( ${#allowed_cpus[@]} > 0 )) || { echo 'No allowed CPUs found' >&2; exit 1; }
+    cpus=${allowed_cpus[-1]}
+    if (( ${#allowed_cpus[@]} > 1 )); then cpus="${allowed_cpus[-2]},$cpus"; fi
+fi
+taskset -c "$cpus" true
+export ZED_LOW_LOAD_REAL_CARGO
+ZED_LOW_LOAD_REAL_CARGO=$(command -v "${CARGO:-cargo}")
+export CC=${CC:-clang} CXX=${CXX:-clang++} ZED_HEADLESS=1
+export ZED_UPDATE_EXPLANATION=${ZED_UPDATE_EXPLANATION:-'Fetch and rebuild the custom Zed checkout to update.'}
+configure_resources() {
+    export CARGO_BUILD_JOBS=$jobs
+    cargo_arguments=(--profile release-quick --config .cargo/release-quick.toml --locked -j "$jobs")
+    clippy_arguments=(--config .cargo/release-quick.toml --locked -j "$jobs")
+    if [[ ${ZED_LOW_LOAD_OFFLINE:-1} == 1 ]]; then
+        export CARGO_NET_OFFLINE=true
+        cargo_arguments+=(--offline)
+        clippy_arguments+=(--offline)
+    else
+        export CARGO_NET_OFFLINE=false
+    fi
+    limits=(nice -n 19 ionice -c 3 taskset -c "$cpus")
+}
+configure_resources
+test_arguments=(--config profile.release-quick.package.editor.opt-level=0 --config profile.release-quick.package.editor.codegen-units=16 --config profile.release-quick.package.zed.opt-level=1 --config profile.release-quick.package.zed.codegen-units=16)
+
+run_directory=/DRY-RUN
+if ! $dry_run; then
+    mkdir -p "$repository/target/" "$data_directory/"
+    # Prevent two copies of this runner from competing for the same build artifacts.
+    exec 9> "$repository/target/low-load.lock"
+    flock -n 9 || { echo 'Another low-load runner is active in this checkout' >&2; exit 1; }
+    run_directory=$(mktemp -d "$data_directory/run-$(date +%Y%m%d-%H%M%S).XXXXXX")
+    ln -sfn "$run_directory" "$data_directory/latest"
+    printf '%s\t%s\t%s\t%s\n' "$$" "$(process_start_time "$$")" "$repository" "$affinity" > "$run_directory/runner.tsv"
+    printf '%s\t%s\n' "$cpus" "$jobs" > "$run_directory/resources.tsv"
+    printf 'manual\n' > "$run_directory/mode"
+    : > "$run_directory/results.tsv"
+    exec > >(tee "$run_directory/output.log") 2>&1
+    phase=starting
+    record_exit() {
+        local result=$?
+        printf 'finished\t%s\t%s\t%s\n' "$(date -Is)" "$phase" "$result" > "$run_directory/status"
+        if [[ -n ${auto_pid:-} ]]; then
+            if kill -0 "$auto_pid" 2>/dev/null; then kill -TERM "$auto_pid" || true; fi
+            wait "$auto_pid" || true
+        fi
+    }
+    trap record_exit EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if $automatic; then
+        python3 "$repository/script/low-load-auto.py" -q monitor --run-directory "$run_directory" &
+        auto_pid=$!
+    fi
+fi
+printf 'CPUs: %s; Cargo jobs: %s; logs: %s\n' "$cpus" "$jobs" "$run_directory"
+
+for phase in "${selected[@]}"; do
+    if ! $dry_run; then
+        IFS=$'\t' read -r cpus jobs < "$run_directory/resources.tsv"
+        configure_resources
+    fi
+    case "$phase" in
+        worktree-watch)
+            command=("$ZED_LOW_LOAD_REAL_CARGO" test "${cargo_arguments[@]}" -p worktree --features test-support --test integration test_zhack_watch_exclusions -- --test-threads=1) ;;
+        worktree-settings)
+            command=("$ZED_LOW_LOAD_REAL_CARGO" test "${cargo_arguments[@]}" -p worktree --features test-support --test integration worktree_settings_tests:: -- --test-threads=1) ;;
+        related-library-tests)
+            command=("$ZED_LOW_LOAD_REAL_CARGO" test "${cargo_arguments[@]}" "${test_arguments[@]}" -p migrator -p open_path_prompt -p gpui -p language -p editor -p file_finder -p search --lib -- migrations::zhack test_make_file_finder_include_ignored_an_enum zhack_search_controls test_action_dispatch_observer test_indentation_override test_set_indentation test_personal_ selection_tools::tests test_insert_date test_tilix_directory clipboard::tests:: test_paste_image test_paste_multiple_images test_file_urls_open_in_current_workspace test_reveal_clicked_links_picker_fallback file_finder_tests:: multi_select_tests:: test_zhack_search_exclusions --test-threads=1) ;;
+        project-settings)
+            command=("$ZED_LOW_LOAD_REAL_CARGO" test "${cargo_arguments[@]}" "${test_arguments[@]}" -p project --features test-support --test integration disable_ai -- --test-threads=1) ;;
+        command-history)
+            command=("$ZED_LOW_LOAD_REAL_CARGO" test "${cargo_arguments[@]}" "${test_arguments[@]}" -p zed --bin zed command_history::tests -- --test-threads=1) ;;
+        clippy)
+            command=(env ZED_LOW_LOAD_CARGO_WRAPPER=1 CARGO="$script_path" ./script/clippy "${clippy_arguments[@]}" -p worktree -p migrator -p file_finder -p open_path_prompt -p search -p settings -p editor -p gpui -p language -p project -p zed -p cli) ;;
+        licenses)
+            command=(./script/generate-licenses "$run_directory/licenses.md") ;;
+        build)
+            command=("$ZED_LOW_LOAD_REAL_CARGO" build "${cargo_arguments[@]}" -p zed -p cli) ;;
+    esac
+    printf '\n[%s] %s (CPUs: %s; Cargo jobs: %s)\n' "$(date -Is)" "$phase" "$cpus" "$jobs"
+    if $dry_run; then
+        printf '%q ' "${limits[@]}" "${command[@]}"
+        printf '\n'
+        continue
+    fi
+    printf 'running\t%s\t%s\n' "$(date -Is)" "$phase" > "$run_directory/status"
+    result=0
+    "${limits[@]}" "${command[@]}" || result=$?
+    if [[ $phase == licenses && $result == 0 ]]; then
+        cp "$run_directory/licenses.md" assets/licenses.md || result=$?
+    fi
+    printf '%s\t%s\t%s\n' "$(date -Is)" "$phase" "$result" >> "$run_directory/results.tsv"
+    if (( result != 0 )); then exit "$result"; fi
+done

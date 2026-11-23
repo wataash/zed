@@ -909,6 +909,7 @@ pub struct App {
 
     pub(crate) observers: SubscriberSet<EntityId, Handler>,
     pub(crate) event_listeners: SubscriberSet<EntityId, (TypeId, Listener)>,
+    action_dispatch_observers: SingleSubscriberSet<Box<dyn FnMut(&dyn Action, &mut App)>>,
     pub(crate) keystroke_observers: SingleSubscriberSet<KeystrokeObserver>,
     pub(crate) keystroke_interceptors: SingleSubscriberSet<KeystrokeObserver>,
     pub(crate) keyboard_layout_observers: SingleSubscriberSet<Handler>,
@@ -1066,6 +1067,7 @@ impl App {
                 current_window_by_entity: FxHashMap::default(),
                 event_listeners: SubscriberSet::new(),
                 release_listeners: SubscriberSet::new(),
+                action_dispatch_observers: SingleSubscriberSet::new(),
                 keystroke_observers: SingleSubscriberSet::new(),
                 keystroke_interceptors: SingleSubscriberSet::new(),
                 keyboard_layout_observers: SingleSubscriberSet::new(),
@@ -2806,6 +2808,22 @@ impl App {
         })
     }
 
+    /// Observes dispatched actions from keyboards, menus, and programmatic callers.
+    /// This reports dispatch attempts, including actions with no matching handler.
+    pub fn observe_action_dispatch(
+        &self,
+        observer: impl FnMut(&dyn Action, &mut App) + 'static,
+    ) -> Subscription {
+        self.action_dispatch_observers.insert(Box::new(observer))
+    }
+
+    pub(crate) fn notify_action_dispatch(&mut self, action: &dyn Action) {
+        self.action_dispatch_observers.clone().retain(|observer| {
+            observer(action, self);
+            true
+        });
+    }
+
     /// Register a callback to be invoked after a keystroke is resolved in any window,
     /// including the action that handled it, if any. Keystrokes consumed by an
     /// interceptor or raw keyboard event handler are not observed.
@@ -3060,6 +3078,7 @@ impl App {
     }
 
     fn dispatch_global_action(&mut self, action: &dyn Action) {
+        self.notify_action_dispatch(action);
         self.propagate_event = true;
 
         if let Some(mut global_listeners) = self
@@ -3805,8 +3824,8 @@ mod test {
     use std::os::unix::ffi::OsStringExt;
 
     use crate::{
-        AppContext, Context, Empty, FallbackFontClass, IntoElement, MissingGlyph, Render,
-        TestAppContext, Window,
+        AppContext, Context, Empty, FallbackFontClass, FocusHandle, InteractiveElement,
+        IntoElement, KeyBinding, MissingGlyph, Render, TestAppContext, Window, div,
     };
 
     #[gpui::test]
@@ -3865,6 +3884,58 @@ mod test {
             self.0.set(self.0.get() + 1);
             Empty
         }
+    }
+
+    crate::actions!(action_dispatch_test, [Observed, Unbound]);
+
+    struct FocusedView(FocusHandle);
+
+    impl Render for FocusedView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.0)
+        }
+    }
+
+    #[gpui::test]
+    fn test_action_dispatch_observer(cx: &mut TestAppContext) {
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let subscription = cx.update(|cx| {
+            let observed = observed.clone();
+            cx.observe_action_dispatch(move |action, _| observed.borrow_mut().push(action.name()))
+        });
+
+        // Without a window, programmatic dispatch only reaches global handlers.
+        cx.update(|cx| cx.dispatch_action(&Unbound));
+        assert_eq!(
+            observed.borrow().as_slice(),
+            ["action_dispatch_test::Unbound"]
+        );
+        observed.borrow_mut().clear();
+
+        let (view, cx) = cx.add_window_view(|_, cx| FocusedView(cx.focus_handle()));
+        cx.update(|_, cx| cx.bind_keys([KeyBinding::new("ctrl-o", Observed, None)]));
+        view.update_in(cx, |view, window, cx| window.focus(&view.0, cx));
+
+        // Attempts are observed even though nothing handles the action.
+        cx.simulate_keystrokes("ctrl-o");
+        assert_eq!(
+            observed.borrow().as_slice(),
+            ["action_dispatch_test::Observed"]
+        );
+
+        cx.update(|window, cx| window.dispatch_action(Box::new(Unbound), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            observed.borrow().as_slice(),
+            [
+                "action_dispatch_test::Observed",
+                "action_dispatch_test::Unbound"
+            ]
+        );
+
+        drop(subscription);
+        cx.simulate_keystrokes("ctrl-o");
+        assert_eq!(observed.borrow().len(), 2);
     }
 
     #[gpui::test]

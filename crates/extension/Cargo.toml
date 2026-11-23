@@ -13,6 +13,7 @@ path = "src/extension.rs"
 doctest = false
 
 [dependencies]
+zed_editor_command_api.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 cloud_api_types.workspace = true

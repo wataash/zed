@@ -42,6 +42,9 @@ impl RootUserSettings for ProjectSettingsContent {
 #[with_fallible_options]
 #[derive(Debug, PartialEq, Clone, Default, Serialize, JsonSchema, MergeFrom)]
 pub struct ProjectSettingsContent {
+    /// Custom build settings, also available in project settings.
+    pub zhack: Option<crate::ZhackSettingsContent>,
+
     #[serde(flatten)]
     pub all_languages: AllLanguageSettingsContent,
 
@@ -90,7 +93,7 @@ pub struct ProjectSettingsContent {
 crate::fallible_options::flattened_deserialize!(ProjectSettingsContent {
     sections: { all_languages, worktree },
     options: {
-        terminal, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
+        zhack, terminal, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
     },
     defaults: { lsp, dap, context_servers },
 });

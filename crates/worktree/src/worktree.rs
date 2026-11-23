@@ -1,3 +1,4 @@
+mod git_metadata_watch;
 mod ignore;
 mod worktree_settings;
 
@@ -149,6 +150,7 @@ pub struct LocalWorktree {
     fs: Arc<dyn Fs>,
     fs_case_sensitive: bool,
     visible: bool,
+    track_git_repositories: bool,
     next_entry_id: Arc<AtomicUsize>,
     settings: WorktreeSettings,
     share_private_files: bool,
@@ -156,7 +158,14 @@ pub struct LocalWorktree {
     force_defer_watch: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrefixScope {
+    WithinWorktree,
+    IncludeExternal,
+}
+
 pub struct PathPrefixScanRequest {
+    scope: PrefixScope,
     path: Arc<RelPath>,
     done: SmallVec<[barrier::Sender; 1]>,
 }
@@ -280,7 +289,7 @@ struct BackgroundScannerState {
     symlink_paths_by_target: HashMap<Arc<Path>, SmallVec<[Arc<RelPath>; 1]>>,
     scanned_dirs: HashSet<ProjectEntryId>,
     watched_dir_abs_paths_by_entry_id: HashMap<ProjectEntryId, Arc<Path>>,
-    path_prefixes_to_scan: HashSet<Arc<RelPath>>,
+    path_prefixes_to_scan: HashMap<Arc<RelPath>, PrefixScope>,
     paths_to_scan: HashSet<Arc<RelPath>>,
     removed_entries: RemovedEntries,
     changed_paths: Vec<Arc<RelPath>>,
@@ -608,6 +617,7 @@ impl Worktree {
                 fs,
                 fs_case_sensitive,
                 visible,
+                track_git_repositories: visible,
                 settings,
                 scanning_enabled,
                 force_defer_watch: false,
@@ -1309,6 +1319,15 @@ impl Worktree {
 }
 
 impl LocalWorktree {
+    /// Track Git metadata without adding this worktree to the project panel.
+    pub fn enable_git_tracking(&mut self, cx: &Context<Worktree>) {
+        if !self.track_git_repositories {
+            self.track_git_repositories = true;
+            *self.is_scanning.0.borrow_mut() = true;
+            self.restart_background_scanners(cx);
+        }
+    }
+
     pub fn fs(&self) -> &Arc<dyn Fs> {
         &self.fs
     }
@@ -1356,7 +1375,7 @@ impl LocalWorktree {
         let fs = self.fs.clone();
         let scanning_enabled = self.scanning_enabled;
         let force_defer_watch = self.force_defer_watch;
-        let track_git_repositories = self.visible;
+        let track_git_repositories = self.track_git_repositories;
         let settings = self.settings.clone();
         let (scan_states_tx, mut scan_states_rx) = mpsc::unbounded();
         let background_scanner = cx.background_spawn({
@@ -1371,6 +1390,9 @@ impl LocalWorktree {
                 } else {
                     (Box::pin(stream::pending()) as _, Arc::new(NullWatcher) as _)
                 };
+                let git_watcher = watcher.clone();
+                let watcher =
+                    ExcludingWatcher::wrap(watcher, &abs_path, &settings, fs.clone()).await;
                 let fs_case_sensitive = fs.is_case_sensitive().await;
 
                 let is_single_file = snapshot.snapshot.root_dir().is_none();
@@ -1398,6 +1420,8 @@ impl LocalWorktree {
                     share_private_files,
                     settings,
                     watcher,
+                    git_watcher,
+                    git_watch_paths: Default::default(),
                     track_git_repositories,
                     is_single_file,
                     defer_watch,
@@ -2136,10 +2160,23 @@ impl LocalWorktree {
     }
 
     pub fn add_path_prefix_to_scan(&self, path_prefix: Arc<RelPath>) -> barrier::Receiver {
+        self.scan_path_prefix(path_prefix, PrefixScope::IncludeExternal)
+    }
+
+    pub fn scan_ignored_directory_for_search(&self, path: Arc<RelPath>) -> barrier::Receiver {
+        let scope = match self.settings.scan_symlinks {
+            settings::ScanSymlinksSetting::Always => PrefixScope::IncludeExternal,
+            settings::ScanSymlinksSetting::Expanded => PrefixScope::WithinWorktree,
+        };
+        self.scan_path_prefix(path, scope)
+    }
+
+    fn scan_path_prefix(&self, path_prefix: Arc<RelPath>, scope: PrefixScope) -> barrier::Receiver {
         let (tx, rx) = barrier::channel();
         self.path_prefixes_to_scan_tx
             .try_send(PathPrefixScanRequest {
                 path: path_prefix,
+                scope,
                 done: smallvec![tx],
             })
             .ok();
@@ -4388,6 +4425,8 @@ struct BackgroundScanner {
     next_entry_id: Arc<AtomicUsize>,
     phase: BackgroundScannerPhase,
     watcher: Arc<dyn Watcher>,
+    git_watcher: Arc<dyn Watcher>,
+    git_watch_paths: async_lock::Mutex<HashSet<PathBuf>>,
     settings: WorktreeSettings,
     share_private_files: bool,
     track_git_repositories: bool,
@@ -4552,7 +4591,14 @@ impl BackgroundScanner {
                 .fs
                 .watch(root_abs_path.as_path(), FS_WATCH_LATENCY)
                 .await;
-            self.watcher = watcher;
+            self.git_watcher = watcher.clone();
+            self.watcher = ExcludingWatcher::wrap(
+                watcher,
+                root_abs_path.as_path(),
+                &self.settings,
+                self.fs.clone(),
+            )
+            .await;
             fs_events_rx = Box::pin(events.map(|events| events.into_iter().collect()));
 
             let state = self.state.lock().await;
@@ -4604,6 +4650,20 @@ impl BackgroundScanner {
 
         // Continue processing events until the worktree is dropped.
         self.phase = BackgroundScannerPhase::Events;
+        let added = self.update_minimal_git_watches().await;
+        if !added.is_empty() {
+            // Reload after registering watches to cover commits during the initial scan.
+            self.process_events(
+                added
+                    .into_iter()
+                    .map(|path| PathEvent {
+                        path: path.join("HEAD"),
+                        kind: Some(PathEventKind::Changed),
+                    })
+                    .collect(),
+            )
+            .await;
+        }
 
         let root_path_check_timer = self.executor.timer(ROOT_PATH_CHECK_INTERVAL).fuse();
         futures::pin_mut!(root_path_check_timer);
@@ -4623,7 +4683,13 @@ impl BackgroundScanner {
                 path_prefix_request = self.path_prefixes_to_scan_rx.recv().fuse() => {
                     let Ok(request) = path_prefix_request else { break };
 
-                    if self.state.lock().await.path_prefixes_to_scan.contains(&request.path) {
+                    let (previous, external) = {
+                        let state = self.state.lock().await;
+                        (state.path_prefixes_to_scan.get(&request.path).copied(),
+                         state.snapshot.entry_for_path(&request.path).is_some_and(|entry| entry.is_external))
+                    };
+                    if previous == Some(request.scope) || previous == Some(PrefixScope::IncludeExternal)
+                        || (external && request.scope == PrefixScope::WithinWorktree) {
                         self.send_status_update(false, request.done, &[]).await;
                         continue;
                     }
@@ -4631,11 +4697,11 @@ impl BackgroundScanner {
                     log::trace!("adding path prefix {:?}", request.path);
 
                     let did_scan = self.forcibly_load_paths(std::slice::from_ref(&request.path)).await;
-                    if did_scan {
+                    if did_scan || previous.is_some() {
                         let abs_path =
                         {
                             let mut state = self.state.lock().await;
-                            state.path_prefixes_to_scan.insert(request.path.clone());
+                            state.path_prefixes_to_scan.insert(request.path.clone(), request.scope);
                             state.snapshot.absolutize(&request.path)
                         };
 
@@ -4862,7 +4928,62 @@ impl BackgroundScanner {
         }
     }
 
+    async fn update_minimal_git_watches(&self) -> Vec<PathBuf> {
+        if !cfg!(target_os = "linux")
+            || !self.track_git_repositories
+            || self.settings.watch_exclusions.sources().next().is_none()
+        {
+            return Vec::new();
+        }
+        let (root, repositories) = {
+            let state = self.state.lock().await;
+            (
+                state.snapshot.abs_path.clone(),
+                state
+                    .snapshot
+                    .git_repositories
+                    .values()
+                    .map(|repo| {
+                        (
+                            repo.repository_dir_abs_path.clone(),
+                            repo.common_dir_abs_path.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut desired = HashSet::default();
+        for (directory, common) in repositories {
+            match git_metadata_watch::directories(self.fs.as_ref(), &directory, &common).await {
+                Ok(paths) => desired.extend(paths.into_iter().filter(|path| {
+                    !self.fs.requires_poll_watcher(path)
+                        && is_watch_excluded(&self.settings.watch_exclusions, root.as_path(), path)
+                })),
+                Err(error) => {
+                    log::error!("failed to resolve Git watches for {directory:?}: {error:#}");
+                    // Keep existing watches through a transient HEAD replacement.
+                    return Vec::new();
+                }
+            }
+        }
+        let mut previous = self.git_watch_paths.lock().await;
+        let mut added = Vec::new();
+        for path in desired.difference(&previous) {
+            if self.git_watcher.add(path).log_err().is_some() {
+                added.push(path.clone());
+            }
+        }
+        // Add new paths before removing old ones to avoid a gap on branch switches.
+        for path in previous.difference(&desired) {
+            self.git_watcher.remove(path).log_err();
+        }
+        previous.retain(|path| desired.contains(path));
+        previous.extend(added.iter().cloned());
+        added
+    }
+
     async fn process_events(&self, mut events: Vec<PathEvent>) {
+        self.update_minimal_git_watches().await;
         let root_path = self.state.lock().await.snapshot.abs_path.clone();
         let root_canonical_path = match self.fs.canonicalize(root_path.as_path()).await {
             Ok(path) => path,
@@ -5205,6 +5326,7 @@ impl BackgroundScanner {
         )
         .await;
 
+        self.update_minimal_git_watches().await;
         let affected_repo_roots = if !dot_git_abs_paths.is_empty() {
             self.update_git_repositories(dot_git_abs_paths).await
         } else {
@@ -5437,21 +5559,40 @@ impl BackgroundScanner {
         // paths) and `watched_dir_abs_paths_by_entry_id` (used by `remove_path`
         // to know which abs path to unwatch), so both cleanup paths agree on
         // the path the watcher was actually registered on.
-        let watched_abs_path: Option<Arc<Path>> = if job.is_external {
+        let mut watched_abs_path: Option<Arc<Path>> = if job.is_external {
             self.fs
                 .canonicalize(job.abs_path.as_ref())
                 .await
                 .ok()
-                .map(|canonical| {
-                    let canonical: Arc<Path> = canonical.into();
-                    self.watcher.add(&canonical).log_err();
-                    canonical
-                })
+                .map(Arc::from)
         } else {
-            self.watcher.add(job.abs_path.as_ref()).log_err();
             Some(job.abs_path.clone())
         };
 
+        if cfg!(target_os = "linux") && self.settings.watch_exclusions.sources().next().is_some() {
+            // Resolve internal symlinks too: an alias must not create an inotify
+            // watch on an excluded target. Keep the original registration path
+            // for allowed internal symlinks so event translation stays unchanged.
+            let canonical = self.fs.canonicalize(job.abs_path.as_ref()).await.log_err();
+            let excluded = canonical.as_ref().is_none_or(|canonical| {
+                !self.fs.requires_poll_watcher(canonical)
+                    && (is_watch_excluded(
+                        &self.settings.watch_exclusions,
+                        root_abs_path.as_ref(),
+                        canonical,
+                    ) || is_watch_excluded(
+                        &self.settings.watch_exclusions,
+                        root_abs_path.as_ref(),
+                        job.abs_path.as_ref(),
+                    ))
+            });
+            if excluded {
+                watched_abs_path = None;
+            }
+        }
+        if let Some(path) = &watched_abs_path {
+            self.watcher.add(path).log_err();
+        }
         if let Some(watched_abs_path) = watched_abs_path {
             // Deletion cleanup needs the canonical path even if enumeration fails.
             let mut state = self.state.lock().await;
@@ -6336,7 +6477,7 @@ impl BackgroundScanner {
             || state
                 .path_prefixes_to_scan
                 .iter()
-                .any(|p| entry.path.starts_with(p))
+                .any(|(prefix, scope)| (!entry.is_external || *scope == PrefixScope::IncludeExternal) && entry.path.starts_with(prefix))
     }
 
     async fn next_scan_request(&self) -> Result<ScanRequest> {
@@ -7267,6 +7408,87 @@ async fn discover_git_paths(dot_git_abs_path: &Arc<Path>, fs: &dyn Fs) -> (Arc<P
     (repository_dir_abs_path, common_dir_abs_path)
 }
 
+/// Filters every registration path, including Git metadata and symlink targets.
+/// Linux watches are non-recursive; recursive backends cannot enforce this policy.
+struct ExcludingWatcher {
+    inner: Arc<dyn Watcher>,
+    fs: Arc<dyn Fs>,
+    root: PathBuf,
+    exclusions: util::paths::PathMatcher,
+}
+
+impl ExcludingWatcher {
+    async fn wrap(
+        inner: Arc<dyn Watcher>,
+        root: &Path,
+        settings: &WorktreeSettings,
+        fs: Arc<dyn Fs>,
+    ) -> Arc<dyn Watcher> {
+        if !cfg!(target_os = "linux") || settings.watch_exclusions.sources().next().is_none() {
+            return inner;
+        }
+        let watcher = Self {
+            inner,
+            fs,
+            root: root.to_path_buf(),
+            exclusions: settings.watch_exclusions.clone(),
+        };
+        // Fs::watch registers the root before returning its watcher.
+        if watcher.is_excluded(root) {
+            watcher.inner.remove(root).log_err();
+        }
+        if watcher.fs.read_link(root).await.is_ok()
+            && let Some(target) = watcher.fs.canonicalize(root).await.log_err()
+        {
+            if watcher.is_excluded(&target) {
+                watcher.inner.remove(&target).log_err();
+            }
+            // Fs::watch also follows the target's parent for symlink roots.
+            if let Some(parent) = target.parent()
+                && watcher.is_excluded(parent)
+            {
+                watcher.inner.remove(parent).log_err();
+            }
+        }
+        Arc::new(watcher)
+    }
+
+    fn is_excluded(&self, path: &Path) -> bool {
+        if self.fs.requires_poll_watcher(path) {
+            return false;
+        }
+        is_watch_excluded(&self.exclusions, &self.root, path)
+    }
+}
+
+fn is_watch_excluded(exclusions: &util::paths::PathMatcher, root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return path
+            .ancestors()
+            .any(|ancestor| exclusions.is_match_std_path(ancestor));
+    };
+    relative
+        .ancestors()
+        .any(|ancestor| exclusions.is_match_std_path(ancestor))
+        || path
+            .ancestors()
+            .any(|ancestor| exclusions.matches_absolute_pattern(ancestor))
+}
+
+impl Watcher for ExcludingWatcher {
+    fn add(&self, path: &Path) -> Result<()> {
+        if self.is_excluded(path) {
+            Ok(())
+        } else {
+            self.inner.add(path)
+        }
+    }
+
+    fn remove(&self, path: &Path) -> Result<()> {
+        self.inner.remove(path)
+    }
+}
+
 struct NullWatcher;
 
 impl fs::Watcher for NullWatcher {
@@ -7585,6 +7807,8 @@ mod tests {
                     next_entry_id: tree.next_entry_id.clone(),
                     phase: BackgroundScannerPhase::Events,
                     watcher: Arc::new(NullWatcher),
+                    git_watcher: Arc::new(NullWatcher),
+                    git_watch_paths: Default::default(),
                     settings: tree.settings.clone(),
                     share_private_files: tree.share_private_files,
                     track_git_repositories: true,

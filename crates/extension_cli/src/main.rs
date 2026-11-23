@@ -556,6 +556,7 @@ mod tests {
             language_servers: BTreeMap::default(),
             context_servers: BTreeMap::default(),
             slash_commands: BTreeMap::default(),
+            editor_commands: Default::default(),
             snippets: None,
             capabilities: Vec::new(),
             debug_adapters: BTreeMap::default(),

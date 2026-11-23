@@ -12,7 +12,7 @@ use nucleo::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 
 pub use paths::{
     PathMatch, PathMatchCandidate, PathMatchCandidateSet, PathMatchOptions, match_fixed_path_set,
-    match_path_sets,
+    match_path_sets, match_path_sets_filtered,
 };
 pub use strings::{
     StringMatch, StringMatchCandidate, StringMatchOptions, match_strings, match_strings_async,

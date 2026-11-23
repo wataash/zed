@@ -11,8 +11,8 @@ use anyhow::Context as _;
 use gpui::{
     AnyElement, App, AsyncWindowContext, Bounds, Context, Entity, Focusable as _, FontWeight, Hsla,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollHandle, Size,
-    StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, TaskExt,
-    TextStyleRefinement, Window, canvas, div, px,
+    StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, TextStyleRefinement,
+    Window, canvas, div, px,
 };
 use language::{CharKind, DiagnosticEntry, Language, LanguageRegistry};
 use lsp::DiagnosticSeverity;
@@ -30,7 +30,7 @@ use theme_settings::ThemeSettings;
 use ui::{CopyButton, Scrollbars, WithScrollbar, prelude::*, theme_is_transparent};
 use url::Url;
 use util::TryFutureExt;
-use workspace::{OpenOptions, OpenVisible, Workspace};
+use workspace::{OpenOptions, OpenVisible, Workspace, notifications::NotifyTaskExt as _};
 
 use crate::debugger_hover::{
     DEBUGGER_HOVER_MIN_WIDTH, DebuggerHoverView, build_debugger_hover_view,
@@ -1164,18 +1164,31 @@ pub fn open_markdown_url(
         && let Some(workspace) = workspace
     {
         workspace.update(cx, |workspace, cx| {
-            let task = workspace.open_abs_path(
-                path,
-                OpenOptions {
-                    visible: Some(OpenVisible::None),
-                    ..Default::default()
-                },
-                window,
-                cx,
-            );
-
-            cx.spawn_in(window, async move |_, cx| {
-                let item = task.await?;
+            let resolved = project::ResolvedPath::AbsPath {
+                path: path.to_string_lossy().into_owned(),
+                is_dir: false,
+            };
+            if workspace.open_video_link_with_system(&resolved, cx) {
+                return;
+            }
+            cx.spawn_in(window, async move |workspace, cx| {
+                let workspace = workspace.upgrade().context("Workspace closed")?;
+                if Editor::choose_binary_link(&workspace, &resolved, cx).await? {
+                    return Ok(());
+                }
+                let item = workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.open_abs_path(
+                            path,
+                            OpenOptions {
+                                visible: Some(OpenVisible::None),
+                                ..Default::default()
+                            },
+                            window,
+                            cx,
+                        )
+                    })?
+                    .await?;
                 // Ruby LSP uses URLs with #L1,1-4,4
                 // we'll just take the first number and assume it's a line number
                 let Some(fragment) = fragment else {
@@ -1204,7 +1217,7 @@ pub fn open_markdown_url(
                     });
                 })
             })
-            .detach_and_log_err(cx);
+            .detach_and_notify_err(cx.entity().downgrade(), window, cx);
         });
         return;
     }

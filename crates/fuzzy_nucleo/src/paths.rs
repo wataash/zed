@@ -314,6 +314,26 @@ pub async fn match_path_sets<'a, Set: PathMatchCandidateSet<'a>>(
     options: PathMatchOptions<'_>,
     executor: BackgroundExecutor,
 ) -> Vec<PathMatch> {
+    match_path_sets_filtered(
+        candidate_sets,
+        query,
+        relative_to,
+        options,
+        executor,
+        |_| true,
+    )
+    .await
+}
+
+/// Apply the path filter before limiting results to the best matches.
+pub async fn match_path_sets_filtered<'a, Set: PathMatchCandidateSet<'a>>(
+    candidate_sets: &'a [Set],
+    query: &str,
+    relative_to: &Option<Arc<RelPath>>,
+    options: PathMatchOptions<'_>,
+    executor: BackgroundExecutor,
+    include: impl Fn(&RelPath) -> bool + Sync,
+) -> Vec<PathMatch> {
     let PathMatchOptions {
         max_results,
         cancel_flag,
@@ -352,6 +372,7 @@ pub async fn match_path_sets<'a, Set: PathMatchCandidateSet<'a>>(
                 .zip(matchers.iter_mut())
                 .enumerate()
             {
+                let include = &include;
                 let query = &query;
                 let relative_to = relative_to.clone();
                 scope.spawn(async move {
@@ -390,6 +411,7 @@ pub async fn match_path_sets<'a, Set: PathMatchCandidateSet<'a>>(
                         }
                         tree_start = tree_end;
                     }
+                    results.retain(|m| include(&m.path));
                 });
             }
         })

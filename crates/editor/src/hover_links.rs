@@ -3509,6 +3509,108 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_file_urls_use_binary_preview_hook(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let tree = util::test::TempTree::new(serde_json::json!({"image data.bin":"%PDF-1.7"}));
+        let path = tree.path().join("image data.bin");
+        assert!(workspace::binary_files::is_binary_file(&path).expect("binary fixture"));
+        let url = url::Url::from_file_path(&path).expect("file URL");
+        let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        cx.update(|_, cx| {
+            let calls = calls.clone();
+            let registry = cx.default_global::<extension::editor_commands::EditorCommands>();
+            registry.1.insert("fixture".into(), [("preview-file".into(), Default::default())].into_iter().collect());
+            registry.0.insert("fixture".into(), Arc::new(move |command, input| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    assert_eq!(command, "preview-file");
+                    let input: zed_editor_command_api::CommandInput = serde_json::from_str(&input)?;
+                    assert_eq!(input.arguments["reason"], "link");
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(serde_json::json!({"file_presentation":{"actions":[{"label":"View bytes", "action":"open_view"}]}}).to_string())
+                })
+            }));
+        });
+        for (index, open_with_action) in [false, true].into_iter().enumerate() {
+            cx.set_state(&format!("{url}ˇ"));
+            if open_with_action {
+                cx.update_editor(|editor, window, cx| {
+                    editor.open_url(&crate::actions::OpenUrl, window, cx)
+                });
+            } else {
+                let suffix = url.as_str().strip_prefix("file:///").expect("file URL");
+                let position = cx.pixel_position(&format!("file:///ˇ{suffix}"));
+                let modifiers = cx.read(Modifiers::secondary_key);
+                cx.simulate_mouse_move(position, None, modifiers);
+                cx.simulate_click(position, modifiers);
+            }
+            cx.run_until_parked();
+            assert_eq!(calls.load(Ordering::SeqCst), index + 1);
+            cx.update_editor(|editor, _, _| {
+                assert!(editor.mouse_context_menu.is_some());
+                editor.mouse_context_menu.take();
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_file_urls_open_in_current_workspace(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+        let fs = cx.update_workspace(|workspace, _, cx| workspace.project().read(cx).fs().clone());
+        let target_path = path!("/external/日本語 notes.md");
+        fs.as_fake()
+            .insert_tree(
+                path!("/external"),
+                serde_json::json!({"日本語 notes.md": "first\nsecond\n"}),
+            )
+            .await;
+        let mut url = url::Url::from_file_path(target_path).expect("absolute file URL");
+        url.set_fragment(Some("2"));
+
+        for open_with_action in [false, true] {
+            cx.set_state(&format!("{url}ˇ"));
+            let url_path = url
+                .as_str()
+                .strip_prefix("file:///")
+                .expect("file URL prefix");
+            let screen_coord = cx.pixel_position(&format!("file:///ˇ{url_path}"));
+            if open_with_action {
+                cx.update_editor(|editor, window, cx| {
+                    editor.open_url(&crate::actions::OpenUrl, window, cx)
+                });
+            } else {
+                let modifiers = cx.read(Modifiers::secondary_key);
+                cx.simulate_mouse_move(screen_coord, None, modifiers);
+                cx.simulate_click(screen_coord, modifiers);
+            }
+            cx.run_until_parked();
+            assert_eq!(
+                cx.opened_url(),
+                None,
+                "file URL must not reach the OS handler"
+            );
+            cx.update_workspace(|workspace, window, cx| {
+                let editor = workspace
+                    .active_item_as::<Editor>(cx)
+                    .expect("file should open in this workspace");
+                editor.update(cx, |editor, cx| {
+                    assert_eq!(editor.text(cx), "first\nsecond\n");
+                    let snapshot = editor.snapshot(window, cx);
+                    assert_eq!(
+                        editor
+                            .selections
+                            .newest::<Point>(&snapshot.display_snapshot)
+                            .head(),
+                        Point::new(1, 0)
+                    );
+                });
+            });
+        }
+    }
+
+    #[gpui::test]
     async fn test_hover_preconditions(cx: &mut gpui::TestAppContext) {
         init_test(cx, |_| {});
         let mut cx = EditorLspTestContext::new_rust(

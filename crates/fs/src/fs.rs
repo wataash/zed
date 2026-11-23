@@ -105,6 +105,8 @@ pub trait Fs: Send + Sync {
     async fn create_dir(&self, path: &Path) -> Result<()>;
     async fn create_symlink(&self, path: &Path, target: PathBuf) -> Result<()>;
     async fn create_file(&self, path: &Path, options: CreateOptions) -> Result<()>;
+    /// Creates and writes through a new file handle, failing if the path exists.
+    async fn create_file_exclusive(&self, path: &Path, content: &[u8]) -> Result<()>;
     async fn create_file_with(
         &self,
         path: &Path,
@@ -116,6 +118,11 @@ pub trait Fs: Send + Sync {
         content: Archive<Pin<&mut (dyn AsyncRead + Send)>>,
     ) -> Result<()>;
     async fn copy_file(&self, source: &Path, target: &Path, options: CopyOptions) -> Result<()>;
+    /// Atomically rename without overwriting, or fail if unsupported.
+    async fn rename_exclusive(&self, _source: &Path, _target: &Path) -> Result<()> {
+        anyhow::bail!("Atomic no-replace rename is unavailable")
+    }
+
     async fn rename(&self, source: &Path, target: &Path, options: RenameOptions) -> Result<()>;
 
     /// Removes a directory from the filesystem.
@@ -738,6 +745,18 @@ fn read_dir_entries(path: PathBuf) -> Result<impl Send + Iterator<Item = Result<
 
 #[async_trait::async_trait]
 impl Fs for RealFs {
+    async fn create_file_exclusive(&self, path: &Path, content: &[u8]) -> Result<()> {
+        let mut file = smol::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .await?;
+        file.write_all(content).await?;
+        // AsyncWrite can return before the background writer reaches the file.
+        // Callers must be able to read the complete contents and stable metadata.
+        file.flush().await?;
+        Ok(())
+    }
     async fn create_dir(&self, path: &Path) -> Result<()> {
         Ok(smol::fs::create_dir_all(path).await?)
     }
@@ -814,6 +833,16 @@ impl Fs for RealFs {
         }
 
         smol::fs::copy(source, target).await?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    async fn rename_exclusive(&self, source: &Path, target: &Path) -> Result<()> {
+        let source = source.to_owned();
+        let target = target.to_owned();
+        self.executor
+            .spawn(async move { rename_without_replace(&source, &target) })
+            .await?;
         Ok(())
     }
 
@@ -2998,6 +3027,27 @@ impl FileHandle for FakeHandle {
 #[cfg(feature = "test-support")]
 #[async_trait::async_trait]
 impl Fs for FakeFs {
+    async fn create_file_exclusive(&self, path: &Path, content: &[u8]) -> Result<()> {
+        self.simulate_random_delay().await;
+        let mut state = self.state.lock();
+        let inode = state.get_and_increment_inode();
+        let mtime = state.get_and_increment_mtime();
+        state.write_path(path, |entry| match entry {
+            btree_map::Entry::Occupied(_) => anyhow::bail!("path already exists: {path:?}"),
+            btree_map::Entry::Vacant(entry) => {
+                entry.insert(FakeFsEntry::File {
+                    inode,
+                    mtime,
+                    len: content.len() as u64,
+                    content: content.to_vec(),
+                    git_dir_path: None,
+                });
+                Ok(())
+            }
+        })?;
+        state.emit_event([(path, Some(PathEventKind::Created))]);
+        Ok(())
+    }
     async fn create_dir(&self, path: &Path) -> Result<()> {
         self.simulate_random_delay().await;
 
@@ -3113,6 +3163,10 @@ impl Fs for FakeFs {
             }
         }
         Ok(())
+    }
+
+    async fn rename_exclusive(&self, source: &Path, target: &Path) -> Result<()> {
+        self.rename(source, target, RenameOptions::default()).await
     }
 
     async fn rename(&self, old_path: &Path, new_path: &Path, options: RenameOptions) -> Result<()> {

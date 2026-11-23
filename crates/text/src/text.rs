@@ -1306,6 +1306,16 @@ impl Buffer {
         self.history.undo_stack.last()
     }
 
+    /// Whether an edit can still be reached through local undo or redo, including grouped transactions.
+    pub fn has_history_edit(&self, edit: Lamport) -> bool {
+        self.history
+            .redo_stack
+            .iter()
+            .chain(&self.history.undo_stack)
+            .rev()
+            .any(|entry| entry.transaction.edit_ids.contains(&edit))
+    }
+
     pub fn peek_redo_stack(&self) -> Option<&HistoryEntry> {
         self.history.redo_stack.last()
     }

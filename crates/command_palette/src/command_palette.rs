@@ -119,11 +119,15 @@ impl CommandPalette {
     ) -> Self {
         let filter = CommandPaletteFilter::try_global(cx);
 
-        let commands = window
+        let mut commands: Vec<Command> = window
             .available_actions(cx)
             .into_iter()
             .filter_map(|action| {
-                if filter.is_some_and(|filter| filter.is_hidden(&*action)) {
+                if matches!(
+                    action.name(),
+                    "editor::ExecuteExtensionCommand" | "editor::ExecuteCodeAction"
+                ) || filter.is_some_and(|filter| filter.is_hidden(&*action))
+                {
                     return None;
                 }
 
@@ -134,6 +138,16 @@ impl CommandPalette {
                 })
             })
             .collect();
+
+        commands.extend(extension_commands(cx));
+        let configured = configured_commands(&CommandPaletteSettings::get_global(cx).commands, cx);
+        // A configured title replaces the default entry for the same action and arguments.
+        commands.retain(|command| {
+            !configured
+                .iter()
+                .any(|replacement| replacement.action.partial_eq(command.action.as_ref()))
+        });
+        commands.extend(configured);
 
         let delegate = CommandPaletteDelegate::new(
             cx.entity().downgrade(),
@@ -1284,6 +1298,7 @@ mod tests {
         picker.update_in(cx, |picker, window, cx| {
             CommandPaletteSettings::override_global(
                 CommandPaletteSettings {
+                    commands: Default::default(),
                     use_command_history: false,
                 },
                 cx,
@@ -1315,6 +1330,7 @@ mod tests {
         picker.update_in(cx, |picker, window, cx| {
             CommandPaletteSettings::override_global(
                 CommandPaletteSettings {
+                    commands: Default::default(),
                     use_command_history: true,
                 },
                 cx,
@@ -1844,4 +1860,109 @@ mod tests {
             assert_eq!(palette.query(cx), "");
         });
     }
+}
+
+fn configured_commands(
+    definitions: &std::collections::BTreeMap<String, serde_json::Value>,
+    cx: &App,
+) -> Vec<Command> {
+    definitions
+        .iter()
+        .filter_map(|(title, value)| {
+            let result = (|| -> anyhow::Result<_> {
+                anyhow::ensure!(!title.trim().is_empty(), "Empty command title");
+                let (name, arguments): (String, serde_json::Value) =
+                    serde_json::from_value(value.clone())?;
+                let action = cx.build_action(&name, Some(arguments))?;
+                Ok(Command {
+                    name: title.clone().into(),
+                    action,
+                    usage: None,
+                })
+            })();
+            match result {
+                Ok(command) => Some(command),
+                Err(error) => {
+                    log::error!("Invalid palette command {title}: {error}");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+fn extension_commands(cx: &App) -> Vec<Command> {
+    let mut commands = Vec::new();
+    if let Some(providers) = cx.try_global::<extension::editor_commands::EditorCommands>() {
+        for (extension, definitions) in &providers.1 {
+            for (command, definition) in definitions {
+                if definition.title.is_empty() {
+                    continue;
+                }
+                if let Ok(action) = cx.build_action(
+                    "editor::ExecuteExtensionCommand",
+                    Some(serde_json::json!({
+                        "extension": extension, "command": command,
+                    })),
+                ) {
+                    commands.push(Command {
+                        name: definition.title.clone().into(),
+                        action,
+                        usage: None,
+                    });
+                }
+            }
+        }
+    }
+
+    commands
+}
+
+#[gpui::test]
+fn test_configured_palette_commands(cx: &mut App) {
+    let arguments = serde_json::json!({"extension":"fixture", "command":"note", "arguments":{"directory":"/notes/"}});
+    let definitions = [
+        (
+            "notes: new note".into(),
+            serde_json::json!(["editor::ExecuteExtensionCommand", arguments.clone()]),
+        ),
+        ("invalid".into(), serde_json::json!(["missing::Action", {}])),
+    ]
+    .into_iter()
+    .collect();
+    let commands = configured_commands(&definitions, cx);
+    assert_eq!(commands.len(), 1);
+    let command = commands.first().expect("configured palette entry");
+    assert_eq!(command.name.as_ref(), "notes: new note");
+    let expected = cx
+        .build_action("editor::ExecuteExtensionCommand", Some(arguments))
+        .expect("generic action");
+    assert!(command.action.partial_eq(expected.as_ref()));
+}
+
+#[gpui::test]
+fn test_extension_commands_in_palette(cx: &mut App) {
+    let definition = serde_json::from_value(
+        serde_json::json!({"title":"fixture: new command", "arguments":{"suffix":".x"}}),
+    )
+    .expect("definition");
+    cx.default_global::<extension::editor_commands::EditorCommands>()
+        .1
+        .insert(
+            "fixture".into(),
+            [("new-command".into(), definition)].into_iter().collect(),
+        );
+    let commands = extension_commands(cx);
+    let command = commands.first().expect("extension palette entry");
+    assert_eq!(commands.len(), 1);
+    assert_eq!(command.name.as_ref(), "fixture: new command");
+    let expected = cx
+        .build_action(
+            "editor::ExecuteExtensionCommand",
+            Some(serde_json::json!({"extension":"fixture", "command":"new-command"})),
+        )
+        .expect("generic action");
+    assert!(command.action.partial_eq(expected.as_ref()));
+    extension::editor_commands::unregister("fixture", cx);
+    assert!(extension_commands(cx).is_empty());
 }

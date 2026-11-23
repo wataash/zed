@@ -802,7 +802,7 @@ pub fn parse_path_with_position(argument_str: &str) -> anyhow::Result<String> {
 
 #[derive(Clone)]
 pub struct PathMatcher {
-    sources: Vec<(String, RelPathBuf, /*trailing separator*/ bool)>,
+    sources: Vec<(String, Option<RelPathBuf>, /*trailing separator*/ bool)>,
     glob: GlobSet,
     path_style: PathStyle,
 }
@@ -877,15 +877,15 @@ impl PathMatcher {
     fn from_globs(globs: Vec<Glob>, path_style: PathStyle) -> Result<Self, globset::Error> {
         let sources = globs
             .iter()
-            .filter_map(|glob| {
+            .map(|glob| {
                 let glob = glob.glob();
-                Some((
+                (
                     glob.to_string(),
                     RelPath::new(&glob.as_ref(), path_style)
                         .ok()
-                        .map(std::borrow::Cow::into_owned)?,
+                        .map(std::borrow::Cow::into_owned),
                     glob.ends_with(path_style.separators_ch()),
-                ))
+                )
             })
             .collect();
         let mut glob_builder = GlobSetBuilder::new();
@@ -906,11 +906,11 @@ impl PathMatcher {
 
     pub fn is_match<P: AsRef<RelPath>>(&self, other: P) -> bool {
         let other = other.as_ref();
-        if self
-            .sources
-            .iter()
-            .any(|(_, source, _)| other.starts_with(source) || other.ends_with(source))
-        {
+        if self.sources.iter().any(|(_, source, _)| {
+            source
+                .as_ref()
+                .is_some_and(|source| other.starts_with(source) || other.ends_with(source))
+        }) {
             return true;
         }
         let other_path = other.display(self.path_style);
@@ -923,10 +923,23 @@ impl PathMatcher {
             .is_match(other_path.into_owned() + self.path_style.primary_separator())
     }
 
+    /// Match only rooted patterns when also considering a worktree-relative path.
+    pub fn matches_absolute_pattern(&self, path: &Path) -> bool {
+        let rooted = |source: &str| self.path_style.has_root(Path::new(source));
+        self.sources().any(rooted)
+            && self.glob.matches(path).into_iter().any(|i| {
+                self.sources
+                    .get(i)
+                    .is_some_and(|(pattern, ..)| rooted(pattern))
+            })
+    }
+
     pub fn is_match_std_path<P: AsRef<Path>>(&self, other: P) -> bool {
         let other = other.as_ref();
         if self.sources.iter().any(|(_, source, _)| {
-            other.starts_with(source.as_std_path()) || other.ends_with(source.as_std_path())
+            source.as_ref().is_some_and(|source| {
+                other.starts_with(source.as_std_path()) || other.ends_with(source.as_std_path())
+            })
         }) {
             return true;
         }

@@ -33,7 +33,6 @@ visual-tests = [
     "gpui_platform/screen-capture",
     "gpui_platform/test-support",
     "dep:image",
-    "dep:tempfile",
     "dep:action_log",
     "dep:agent_servers",
     "dep:env_logger",
@@ -136,7 +135,7 @@ rayon.workspace = true
 semver.workspace = true
 system_specs.workspace = true
 tabular_data_preview.workspace = true
-tempfile = { workspace = true, optional = true }
+tempfile.workspace = true
 
 edit_prediction.workspace = true
 edit_prediction_ui.workspace = true

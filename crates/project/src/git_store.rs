@@ -108,6 +108,9 @@ pub struct GitStore {
     parked_repositories: Vec<ParkedRepository>,
     diff_base: GitDiffBaseSetting,
     display_diffs: HashMap<RepositoryId, DisplayDiff>,
+    git_diff_worktrees: HashMap<PathBuf, Entity<Worktree>>,
+    git_diff_sources: HashMap<BufferId, GitDiffSource>,
+    diff_source_generations: HashMap<BufferId, u64>,
     worktree_ids: HashMap<RepositoryId, HashSet<WorktreeId>>,
     active_repo_id: Option<RepositoryId>,
     #[allow(clippy::type_complexity)]
@@ -121,6 +124,13 @@ pub struct GitStore {
 }
 
 const MIN_PARKED_REPOSITORY_DEPTH: usize = 2;
+
+/// A read-only Git baseline for a buffer whose edited file lives elsewhere.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitDiffSource {
+    pub repository: PathBuf,
+    pub path: PathBuf,
+}
 
 pub const MAX_CONCURRENT_OBJECT_READS: usize = 16;
 
@@ -158,6 +168,7 @@ struct SharedDiffs {
 }
 
 struct BufferGitState {
+    mirrored_repository: Option<RepositoryId>,
     unstaged_diff: Option<WeakEntity<BufferDiff>>,
     staged_diff: Option<(WeakEntity<BufferDiff>, Entity<Buffer>)>,
     uncommitted_diff: Option<WeakEntity<BufferDiff>>,
@@ -1042,6 +1053,9 @@ impl GitStore {
             parked_repositories: Vec::new(),
             diff_base: diff_base_setting,
             display_diffs: HashMap::default(),
+            git_diff_worktrees: HashMap::default(),
+            git_diff_sources: HashMap::default(),
+            diff_source_generations: HashMap::default(),
             worktree_ids: HashMap::default(),
             active_repo_id: None,
             _subscriptions,
@@ -1326,12 +1340,13 @@ impl GitStore {
         }
 
         let Some((repo, repo_path)) =
-            self.repository_and_path_for_buffer_id(buffer.read(cx).remote_id(), cx)
+            self.diff_repository_and_path_for_buffer_id(buffer.read(cx).remote_id(), cx)
         else {
             return Task::ready(Err(anyhow!("failed to find git repository for buffer")));
         };
 
-        let is_symlink = Self::buffer_is_symlink(&buffer, cx);
+        let is_symlink = self.diff_file_is_symlink(&buffer, cx);
+        let generation = self.diff_source_generation(buffer_id);
         let task = self
             .loading_diffs
             .entry((buffer_id, DiffKind::Unstaged))
@@ -1347,6 +1362,7 @@ impl GitStore {
                     Self::open_diff_internal(
                         this,
                         DiffKind::Unstaged,
+                        generation,
                         staged_text.await.map(DiffBasesChange::SetIndex),
                         buffer,
                         cx,
@@ -1385,11 +1401,12 @@ impl GitStore {
         }
 
         let Some((repo, repo_path)) =
-            self.repository_and_path_for_buffer_id(buffer.read(cx).remote_id(), cx)
+            self.diff_repository_and_path_for_buffer_id(buffer.read(cx).remote_id(), cx)
         else {
             return Task::ready(Err(anyhow!("failed to find git repository for buffer")));
         };
 
+        let generation = self.diff_source_generation(buffer_id);
         let task = self
             .loading_diffs
             .entry((buffer_id, DiffKind::Staged))
@@ -1399,9 +1416,16 @@ impl GitStore {
                 });
 
                 cx.spawn(async move |this, cx| {
-                    Self::open_diff_internal(this, DiffKind::Staged, changes.await, buffer, cx)
-                        .await
-                        .map_err(Arc::new)
+                    Self::open_diff_internal(
+                        this,
+                        DiffKind::Staged,
+                        generation,
+                        changes.await,
+                        buffer,
+                        cx,
+                    )
+                    .await
+                    .map_err(Arc::new)
                 })
                 .shared()
             })
@@ -1440,6 +1464,11 @@ impl GitStore {
         worktree_ranges: Vec<Range<Anchor>>,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            self.mapped_git_diff_target(buffer.read(cx).remote_id(), cx)
+                .is_none(),
+            "Alternate Git diff baselines are read-only"
+        );
         if worktree_ranges.is_empty() {
             return Ok(());
         }
@@ -1555,6 +1584,11 @@ impl GitStore {
         worktree_ranges: Vec<Range<Anchor>>,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            self.mapped_git_diff_target(buffer.read(cx).remote_id(), cx)
+                .is_none(),
+            "Alternate Git diff baselines are read-only"
+        );
         if worktree_ranges.is_empty() {
             return Ok(());
         }
@@ -1623,6 +1657,10 @@ impl GitStore {
             .buffer_ids_by_index_text_buffer_id
             .get(&index_buffer_id)
             .context("failed to find git state for index text buffer")?;
+        anyhow::ensure!(
+            self.mapped_git_diff_target(buffer_id, cx).is_none(),
+            "Alternate Git diff baselines are read-only"
+        );
         let diff_state = self
             .diffs
             .get(&buffer_id)
@@ -1696,6 +1734,7 @@ impl GitStore {
             return Task::ready(Ok(oid_diff));
         }
 
+        let generation = self.diff_source_generation(buffer_id);
         let diff_kind = DiffKind::SinceOid(oid);
         if let Some(task) = self.loading_diffs.get(&(buffer_id, diff_kind)) {
             let task = task.clone();
@@ -1741,13 +1780,14 @@ impl GitStore {
                     });
 
                     let recalculation = this.update(cx, |this, cx| {
+                        this.check_diff_source(buffer_id, generation)?;
                         let git_store = cx.weak_entity();
                         let diff_state = this
                             .diffs
                             .entry(buffer_id)
                             .or_insert_with(|| cx.new(|cx| BufferGitState::new(git_store, cx)));
 
-                        diff_state.update(cx, |state, cx| {
+                        Ok::<_, anyhow::Error>(diff_state.update(cx, |state, cx| {
                             if let Some(oid) = oid {
                                 if let Some(content) = content {
                                     state.oid_texts.insert(oid, content);
@@ -1759,8 +1799,8 @@ impl GitStore {
                                 state.recalculate_diffs(buffer.text_snapshot(), cx);
                             }
                             state.wait_for_recalculation()
-                        })
-                    })?;
+                        }))
+                    })??;
                     if let Some(recalculation) = recalculation {
                         recalculation.await;
                     }
@@ -1770,7 +1810,9 @@ impl GitStore {
                 .await;
                 // Remove the entry on failure too, so the next call retries the load.
                 this.update(cx, |this, _| {
-                    this.loading_diffs.remove(&(buffer_id, diff_kind));
+                    if this.diff_source_generation(buffer_id) == generation {
+                        this.loading_diffs.remove(&(buffer_id, diff_kind));
+                    }
                 })
                 .ok();
                 result.map_err(Arc::new)
@@ -1789,6 +1831,42 @@ impl GitStore {
         buffer: Entity<Buffer>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<BufferDiff>>> {
+        let buffer_id = buffer.read(cx).remote_id();
+        if let Some((root, _)) = self.mapped_git_diff_target(buffer_id, cx) {
+            if !self.git_diff_worktrees.contains_key(&root) {
+                let existing = self
+                    .worktree_store
+                    .read(cx)
+                    .worktrees()
+                    .find(|tree| tree.read(cx).abs_path().as_ref() == root.as_path());
+                let task = if let Some(tree) = existing {
+                    Task::ready(Ok(tree))
+                } else {
+                    self.worktree_store
+                        .update(cx, |store, cx| store.create_worktree(&root, false, cx))
+                };
+                let generation = self.diff_source_generation(buffer_id);
+                return cx.spawn(async move |this, cx| {
+                    let tree = task.await?;
+                    let scan = tree
+                        .update(cx, |tree, cx| {
+                            tree.as_local_mut().map(|local| {
+                                local.enable_git_tracking(cx);
+                                local.scan_complete()
+                            })
+                        })
+                        .context("Alternate Git diff roots require a local worktree")?;
+                    scan.await;
+                    this.update(cx, |this, cx| {
+                        this.check_diff_source(buffer_id, generation)?;
+                        this.git_diff_worktrees.insert(root, tree);
+                        Ok::<_, anyhow::Error>(this.open_uncommitted_diff(buffer, cx))
+                    })??
+                    .await
+                });
+            }
+            return self.open_uncommitted_diff(buffer, cx);
+        }
         let mut branch_base = None;
         if self.diff_base == GitDiffBaseSetting::DefaultBranch
             && let Some((repo, repo_path)) =
@@ -1844,12 +1922,13 @@ impl GitStore {
         }
 
         let Some((repo, repo_path)) =
-            self.repository_and_path_for_buffer_id(buffer.read(cx).remote_id(), cx)
+            self.diff_repository_and_path_for_buffer_id(buffer.read(cx).remote_id(), cx)
         else {
             return Task::ready(Err(anyhow!("failed to find git repository for buffer")));
         };
 
-        let is_symlink = Self::buffer_is_symlink(&buffer, cx);
+        let is_symlink = self.diff_file_is_symlink(&buffer, cx);
+        let generation = self.diff_source_generation(buffer_id);
         let task = self
             .loading_diffs
             .entry((buffer_id, DiffKind::Uncommitted))
@@ -1864,9 +1943,16 @@ impl GitStore {
 
                 // todo(lw): hot foreground spawn
                 cx.spawn(async move |this, cx| {
-                    Self::open_diff_internal(this, DiffKind::Uncommitted, changes.await, buffer, cx)
-                        .await
-                        .map_err(Arc::new)
+                    Self::open_diff_internal(
+                        this,
+                        DiffKind::Uncommitted,
+                        generation,
+                        changes.await,
+                        buffer,
+                        cx,
+                    )
+                    .await
+                    .map_err(Arc::new)
                 })
                 .shared()
             })
@@ -1879,35 +1965,34 @@ impl GitStore {
     async fn open_diff_internal(
         this: WeakEntity<Self>,
         kind: DiffKind,
+        generation: u64,
         texts: Result<DiffBasesChange>,
         buffer_entity: Entity<Buffer>,
         cx: &mut AsyncApp,
     ) -> Result<Entity<BufferDiff>> {
-        let diff_bases_change = match texts {
-            Err(e) => {
-                this.update(cx, |this, cx| {
-                    let buffer = buffer_entity.read(cx);
-                    let buffer_id = buffer.remote_id();
-                    this.loading_diffs.remove(&(buffer_id, kind));
-                })?;
-                return Err(e);
-            }
-            Ok(change) => change,
-        };
-
         this.update(cx, |this, cx| {
             let buffer = buffer_entity.read(cx);
             let buffer_id = buffer.remote_id();
+            this.check_diff_source(buffer_id, generation)?;
+            this.loading_diffs.remove(&(buffer_id, kind));
+            let diff_bases_change = texts?;
             let language = buffer.language().cloned();
             let language_registry = buffer.language_registry();
             let index_text_file = buffer.file().map(|file| {
                 Arc::new(IndexTextFile::new(file.as_ref(), cx)) as Arc<dyn language::File>
             });
             let text_snapshot = buffer.text_snapshot();
-            this.loading_diffs.remove(&(buffer_id, kind));
 
             let git_store = cx.weak_entity();
-            let project = this.project.clone();
+            let mirrored_repository = this
+                .mapped_git_diff_target(buffer_id, cx)
+                .and_then(|_| this.diff_repository_and_path_for_buffer_id(buffer_id, cx))
+                .map(|(repository, _)| repository.read(cx).id);
+            let project = if mirrored_repository.is_some() {
+                None
+            } else {
+                this.project.clone()
+            };
             let diff_state = this
                 .diffs
                 .entry(buffer_id)
@@ -1992,6 +2077,7 @@ impl GitStore {
                 diff
             };
             let rx = diff_state.update(cx, |diff_state, cx| {
+                diff_state.mirrored_repository = mirrored_repository;
                 diff_state.language = language;
                 diff_state.language_registry = language_registry;
 
@@ -3011,6 +3097,9 @@ impl GitStore {
                 }
             }
             BufferStoreEvent::BufferDropped(buffer_id) => {
+                self.git_diff_sources.remove(buffer_id);
+                self.diff_source_generations.remove(buffer_id);
+                self.release_unused_git_diff_worktrees();
                 self.diffs.remove(buffer_id);
                 self.buffer_ids_by_index_text_buffer_id
                     .retain(|_, main_buffer_id| main_buffer_id != buffer_id);
@@ -3019,6 +3108,12 @@ impl GitStore {
                 }
             }
             BufferStoreEvent::BufferChangedFilePath { buffer, .. } => {
+                let buffer_id = buffer.read(cx).remote_id();
+                if self.git_diff_sources.remove(&buffer_id).is_some() {
+                    self.release_unused_git_diff_worktrees();
+                    self.invalidate_diff_source(buffer_id);
+                    cx.emit(GitStoreEvent::DiffBaseChanged(None));
+                }
                 self.activate_parked_repositories_for_buffer(buffer, cx);
                 // Whenever a buffer's file path changes, it's possible that the
                 // new path is actually a path that is being tracked by a git
@@ -3026,14 +3121,14 @@ impl GitStore {
                 // `BufferDiffState`, in case it already has one.
                 let buffer_id = buffer.read(cx).remote_id();
                 let diff_state = self.diffs.get(&buffer_id);
-                let repo = self.repository_and_path_for_buffer_id(buffer_id, cx);
+                let repo = self.diff_repository_and_path_for_buffer_id(buffer_id, cx);
 
                 if let Some(diff_state) = diff_state
                     && let Some((repo, repo_path)) = repo
                 {
                     let buffer = buffer.clone();
                     let diff_state = diff_state.clone();
-                    let is_symlink = Self::buffer_is_symlink(&buffer, cx);
+                    let is_symlink = self.diff_file_is_symlink(&buffer, cx);
 
                     cx.spawn(async move |_git_store, cx| {
                         async {
@@ -3226,6 +3321,153 @@ impl GitStore {
         let buffer = self.buffer_store.read(cx).get(buffer_id)?;
         let project_path = buffer.read(cx).project_path(cx)?;
         self.repository_and_path_for_project_path(&project_path, cx)
+    }
+
+    fn invalidate_diff_source(&mut self, id: BufferId) {
+        *self.diff_source_generations.entry(id).or_default() += 1;
+        self.diffs.remove(&id);
+        self.loading_diffs.retain(|(buffer, _), _| *buffer != id);
+        self.buffer_ids_by_index_text_buffer_id
+            .retain(|_, buffer| *buffer != id);
+    }
+
+    fn diff_source_generation(&self, id: BufferId) -> u64 {
+        self.diff_source_generations
+            .get(&id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn check_diff_source(&self, id: BufferId, generation: u64) -> Result<()> {
+        anyhow::ensure!(
+            self.diff_source_generation(id) == generation,
+            "Git diff source changed while loading"
+        );
+        Ok(())
+    }
+
+    fn diff_file_is_symlink(&self, buffer: &Entity<Buffer>, cx: &App) -> bool {
+        if let Some(source) = self.git_diff_sources.get(&buffer.read(cx).remote_id()) {
+            let tree = self
+                .git_diff_worktrees
+                .get(&source.repository)
+                .cloned()
+                .or_else(|| {
+                    self.worktree_store
+                        .read(cx)
+                        .worktrees()
+                        .find(|tree| tree.read(cx).abs_path().as_ref() == source.repository)
+                });
+            return tree.is_some_and(|tree| {
+                let tree = tree.read(cx);
+                RelPath::new(&source.path, tree.path_style())
+                    .ok()
+                    .and_then(|path| tree.entry_for_path(&path))
+                    .is_some_and(|entry| entry.canonical_path.is_some())
+            });
+        }
+        Self::buffer_is_symlink(buffer, cx)
+    }
+
+    fn mapped_git_diff_target(&self, buffer_id: BufferId, _cx: &App) -> Option<(PathBuf, PathBuf)> {
+        if !self.is_local() {
+            return None;
+        }
+        let source = self.git_diff_sources.get(&buffer_id)?;
+        Some((
+            source.repository.clone(),
+            source.repository.join(&source.path),
+        ))
+    }
+
+    fn release_unused_git_diff_worktrees(&mut self) {
+        self.git_diff_worktrees.retain(|root, _| {
+            self.git_diff_sources
+                .values()
+                .any(|source| &source.repository == root)
+        });
+    }
+
+    pub fn set_buffer_diff_source(
+        &mut self,
+        buffer_id: BufferId,
+        source: Option<GitDiffSource>,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let source = source.map(|mut source| {
+            source.repository = util::paths::normalize_path(&source.repository);
+            source
+        });
+        anyhow::ensure!(
+            self.is_local(),
+            "Alternate Git diff baselines require a local project"
+        );
+        let buffer = self
+            .buffer_store
+            .read(cx)
+            .get(buffer_id)
+            .context("Buffer closed")?;
+        anyhow::ensure!(
+            buffer
+                .read(cx)
+                .file()
+                .is_some_and(|file| file.as_local().is_some()),
+            "Open a saved local file"
+        );
+        if let Some(source) = &source {
+            anyhow::ensure!(
+                source.repository.is_absolute(),
+                "The Git repository path must be absolute"
+            );
+            anyhow::ensure!(
+                !source.path.as_os_str().is_empty()
+                    && source
+                        .path
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_))),
+                "The Git file path must be relative and cannot contain parent components"
+            );
+        }
+        if self.git_diff_sources.get(&buffer_id) == source.as_ref() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.diffs.get(&buffer_id).is_none_or(|state| state
+                .read(cx)
+                .pending_index_edits
+                .as_ref()
+                .is_none_or(Vec::is_empty)),
+            "Wait for pending Git index edits before changing the diff source"
+        );
+        match source {
+            Some(source) => {
+                self.git_diff_sources.insert(buffer_id, source);
+            }
+            None => {
+                self.git_diff_sources.remove(&buffer_id);
+            }
+        }
+        self.release_unused_git_diff_worktrees();
+        self.invalidate_diff_source(buffer_id);
+        cx.emit(GitStoreEvent::DiffBaseChanged(None));
+        Ok(())
+    }
+
+    fn diff_repository_and_path_for_buffer_id(
+        &self,
+        buffer_id: BufferId,
+        cx: &App,
+    ) -> Option<(Entity<Repository>, RepoPath)> {
+        if let Some((root, target)) = self.mapped_git_diff_target(buffer_id, cx) {
+            return self.repositories.values().find_map(|repo| {
+                let repository = repo.read(cx);
+                (repository.work_directory_abs_path.as_ref() == root.as_path())
+                    .then(|| repository.abs_path_to_repo_path(&target))
+                    .flatten()
+                    .map(|path| (repo.clone(), path))
+            });
+        }
+        self.repository_and_path_for_buffer_id(buffer_id, cx)
     }
 
     pub fn repository_and_path_for_project_path(
@@ -5237,6 +5479,7 @@ impl GitStore {
 impl BufferGitState {
     fn new(_git_store: WeakEntity<GitStore>, _cx: &mut Context<Self>) -> Self {
         Self {
+            mirrored_repository: None,
             unstaged_diff: Default::default(),
             staged_diff: Default::default(),
             uncommitted_diff: Default::default(),
@@ -6712,13 +6955,23 @@ impl Repository {
                                 let buffer_store = git_store.buffer_store.read(cx);
                                 let buffer = buffer_store.get(*buffer_id)?;
                                 let file = File::from_dyn(buffer.read(cx).file())?;
-                                let abs_path = file.worktree.read(cx).absolutize(&file.path);
+                                let abs_path = if let Some((_, target)) =
+                                    git_store.mapped_git_diff_target(*buffer_id, cx)
+                                {
+                                    if diff_state.read(cx).mirrored_repository != Some(this.id) {
+                                        return None;
+                                    }
+                                    target
+                                } else {
+                                    file.worktree.read(cx).absolutize(&file.path)
+                                };
                                 let repo_path = this.abs_path_to_repo_path(&abs_path)?;
-                                let is_symlink = GitStore::file_is_symlink(file, cx);
+                                let is_symlink = git_store.diff_file_is_symlink(&buffer, cx);
                                 log::debug!(
                                     "start reload diff bases for repo path {}",
                                     repo_path.as_unix_str()
                                 );
+                                let diff_state_id = diff_state.entity_id();
                                 diff_state.update(cx, |diff_state, _| {
                                     let has_unstaged_diff = diff_state
                                         .unstaged_diff
@@ -6735,6 +6988,7 @@ impl Repository {
 
                                     Some((
                                         buffer,
+                                        diff_state_id,
                                         repo_path,
                                         is_symlink,
                                         (has_unstaged_diff || has_staged_diff)
@@ -6751,7 +7005,7 @@ impl Repository {
                 let buffer_diff_base_changes = cx
                     .background_spawn(async move {
                         let mut revisions = Vec::new();
-                        for (_, repo_path, is_symlink, current_index_text, current_head_text) in
+                        for (_, _, repo_path, is_symlink, current_index_text, current_head_text) in
                             &repo_diff_state_updates
                         {
                             if current_index_text.is_some() && !*is_symlink {
@@ -6770,8 +7024,14 @@ impl Repository {
                             .flatten();
 
                         let mut changes = Vec::new();
-                        for (buffer, _, is_symlink, current_index_text, current_head_text) in
-                            &repo_diff_state_updates
+                        for (
+                            buffer,
+                            state_id,
+                            _,
+                            is_symlink,
+                            current_index_text,
+                            current_head_text,
+                        ) in &repo_diff_state_updates
                         {
                             let index_text = (current_index_text.is_some() && !*is_symlink)
                                 .then(|| loaded_revisions.next().flatten())
@@ -6821,17 +7081,21 @@ impl Repository {
                                     (None, None) => None,
                                 };
 
-                            changes.push((buffer.clone(), change))
+                            changes.push((buffer.clone(), *state_id, change))
                         }
                         changes
                     })
                     .await;
 
                 git_store.update(&mut cx, |git_store, cx| {
-                    for (buffer, diff_bases_change) in buffer_diff_base_changes {
+                    for (buffer, state_id, diff_bases_change) in buffer_diff_base_changes {
                         let buffer_snapshot = buffer.read(cx).text_snapshot();
                         let buffer_id = buffer_snapshot.remote_id();
-                        let Some(diff_state) = git_store.diffs.get(&buffer_id) else {
+                        let Some(diff_state) = git_store
+                            .diffs
+                            .get(&buffer_id)
+                            .filter(|state| state.entity_id() == state_id)
+                        else {
                             continue;
                         };
 

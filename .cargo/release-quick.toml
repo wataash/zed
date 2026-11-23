@@ -1,0 +1,9 @@
+# Local builds: less debug info, incremental rebuilds, and mold shorten compile and link times.
+[profile.release-quick]
+inherits = "release-fast"
+debug = "limited"
+incremental = true
+
+# Target rustflags replace `build.rustflags`, so those flags are repeated here.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "symbol-mangling-version=v0", "--cfg", "tokio_unstable", "-C", "link-arg=-fuse-ld=mold"]
